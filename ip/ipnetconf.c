@@ -109,6 +109,10 @@ int print_netconf(struct rtnl_ctrl_data *ctrl, struct nlmsghdr *n, void *arg)
 		print_on_off(PRINT_ANY, "forwarding", "forwarding %s ",
 			     rta_getattr_u32(tb[NETCONFA_FORWARDING]));
 
+	if (tb[NETCONFA_FORCE_FORWARDING])
+		print_on_off(PRINT_ANY, "force_forwarding", "force_forwarding %s ",
+			     rta_getattr_u32(tb[NETCONFA_FORCE_FORWARDING]));
+
 	if (tb[NETCONFA_RP_FILTER]) {
 		__u32 rp_filter = rta_getattr_u32(tb[NETCONFA_RP_FILTER]);
 
