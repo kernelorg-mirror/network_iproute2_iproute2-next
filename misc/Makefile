@@ -6,10 +6,6 @@ TARGETS=ss nstat ifstat rtacct lnstat
 
 include ../config.mk
 
-ifeq ($(HAVE_BERKELEY_DB),y)
-	TARGETS += arpd
-endif
-
 all: $(TARGETS)
 
 ss: $(SSOBJ)
@@ -23,9 +19,6 @@ ifstat: ifstat.c
 
 rtacct: rtacct.c
 	$(QUIET_CC)$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) -o rtacct rtacct.c $(LDLIBS) -lm
-
-arpd: arpd.c
-	$(QUIET_CC)$(CC) $(CFLAGS) -I$(DBM_INCLUDE) $(CPPFLAGS) $(LDFLAGS) -o arpd arpd.c $(LDLIBS) -ldb
 
 ssfilter.tab.c: ssfilter.y
 	$(QUIET_YACC)$(YACC) -b ssfilter ssfilter.y

@@ -24,12 +24,8 @@ CONF_ETC_DIR?=/etc/iproute2
 CONF_USR_DIR?=$(DATADIR)/iproute2
 DOCDIR?=$(DATADIR)/doc/iproute2
 MANDIR?=$(DATADIR)/man
-ARPDDIR?=/var/lib/arpd
 KERNEL_INCLUDE?=/usr/include
 BASH_COMPDIR?=$(DATADIR)/bash-completion/completions
-
-# Path to db_185.h include
-DBM_INCLUDE:=$(DESTDIR)/usr/include
 
 SHARED_LIBS = y
 
@@ -42,7 +38,6 @@ DEFINES+=-DCONF_USR_DIR=\"$(CONF_USR_DIR)\" \
          -DCONF_ETC_DIR=\"$(CONF_ETC_DIR)\" \
          -DNETNS_RUN_DIR=\"$(NETNS_RUN_DIR)\" \
          -DNETNS_ETC_DIR=\"$(NETNS_ETC_DIR)\" \
-         -DARPDDIR=\"$(ARPDDIR)\" \
          -DCONF_COLOR=$(CONF_COLOR)
 
 #options for mpls
