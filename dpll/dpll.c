@@ -606,6 +606,26 @@ static int dpll_cmd(struct dpll *dpll, int argc, char **argv)
 	return -ENOENT;
 }
 
+/* Devices and pins registered or unregistered while a dump is in progress
+ * can be missing from it or be there twice, which the kernel reports with
+ * NLM_F_DUMP_INTR. Print the whole dump and warn the user, as ip does.
+ */
+static int dpll_dump(struct dpll *dpll, uint8_t cmd, mnl_cb_t cb, void *data)
+{
+	struct nlmsghdr *nlh;
+	bool intr;
+	int err;
+
+	nlh = mnlu_gen_socket_cmd_prepare(&dpll->nlg, cmd,
+					  NLM_F_REQUEST | NLM_F_ACK |
+					  NLM_F_DUMP);
+	err = mnlu_gen_socket_sndrcv_dump(&dpll->nlg, nlh, cb, data, &intr);
+	if (!err && intr)
+		pr_err("Dump was interrupted and may be inconsistent.\n");
+
+	return err;
+}
+
 static int dpll_init(struct dpll *dpll)
 {
 	int err;
@@ -1222,17 +1242,12 @@ static int cmd_device_show_id(struct dpll *dpll, __u32 id,
 static int cmd_device_show_dump(struct dpll *dpll,
 				struct dpll_device_filter *filter)
 {
-	struct nlmsghdr *nlh;
 	int err;
-
-	nlh = mnlu_gen_socket_cmd_prepare(&dpll->nlg, DPLL_CMD_DEVICE_GET,
-					  NLM_F_REQUEST | NLM_F_ACK |
-						  NLM_F_DUMP);
 
 	open_json_array(PRINT_JSON, "device");
 
-	err = mnlu_gen_socket_sndrcv(&dpll->nlg, nlh, cmd_device_show_dump_cb,
-				     filter);
+	err = dpll_dump(dpll, DPLL_CMD_DEVICE_GET, cmd_device_show_dump_cb,
+			filter);
 	if (err < 0) {
 		pr_err("Failed to dump devices\n");
 		close_json_array(PRINT_JSON, NULL);
@@ -1961,17 +1976,11 @@ static int cmd_pin_show_id(struct dpll *dpll, __u32 id,
 static int cmd_pin_show_dump(struct dpll *dpll,
 			     struct dpll_pin_filter *filter)
 {
-	struct nlmsghdr *nlh;
 	int err;
-
-	nlh = mnlu_gen_socket_cmd_prepare(&dpll->nlg, DPLL_CMD_PIN_GET,
-					  NLM_F_REQUEST | NLM_F_ACK |
-						  NLM_F_DUMP);
 
 	open_json_array(PRINT_JSON, "pin");
 
-	err = mnlu_gen_socket_sndrcv(&dpll->nlg, nlh, cmd_pin_show_dump_cb,
-				     filter);
+	err = dpll_dump(dpll, DPLL_CMD_PIN_GET, cmd_pin_show_dump_cb, filter);
 	if (err < 0) {
 		pr_err("Failed to dump pins\n");
 		close_json_array(PRINT_JSON, NULL);
