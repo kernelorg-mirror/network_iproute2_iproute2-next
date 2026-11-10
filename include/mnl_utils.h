@@ -2,6 +2,8 @@
 #ifndef __MNL_UTILS_H__
 #define __MNL_UTILS_H__ 1
 
+#include <stdbool.h>
+
 struct mnlu_gen_socket {
 	struct mnl_socket *nl;
 	char *buf;
@@ -22,6 +24,9 @@ struct nlmsghdr *mnlu_gen_socket_cmd_prepare(struct mnlu_gen_socket *nlg,
 					     uint8_t cmd, uint16_t flags);
 int mnlu_gen_socket_sndrcv(struct mnlu_gen_socket *nlg, const struct nlmsghdr *nlh,
 			   mnl_cb_t data_cb, void *data);
+int mnlu_gen_socket_sndrcv_dump(struct mnlu_gen_socket *nlg,
+				const struct nlmsghdr *nlh,
+				mnl_cb_t data_cb, void *data, bool *intr);
 
 struct mnl_socket *mnlu_socket_open(int bus);
 int mnl_add_nl_group(struct mnl_socket *nl, unsigned int group);
