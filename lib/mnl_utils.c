@@ -5,7 +5,7 @@
 
 #include <errno.h>
 #include <string.h>
-#include <time.h>
+#include <sys/socket.h>
 #include <libmnl/libmnl.h>
 #include <linux/genetlink.h>
 
@@ -15,6 +15,7 @@
 
 struct mnl_socket *mnlu_socket_open(int bus)
 {
+	const struct sockaddr_nl kernel_addr = { .nl_family = AF_NETLINK };
 	struct mnl_socket *nl;
 	int one = 1;
 
@@ -26,6 +27,11 @@ struct mnl_socket *mnlu_socket_open(int bus)
 	mnl_socket_setsockopt(nl, NETLINK_EXT_ACK, &one, sizeof(one));
 
 	if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0)
+		goto err_bind;
+
+	/* Refuse unicast from other processes, only the kernel may send */
+	if (connect(mnl_socket_get_fd(nl), (struct sockaddr *)&kernel_addr,
+		    sizeof(kernel_addr)) < 0)
 		goto err_bind;
 
 	return nl;
@@ -40,6 +46,16 @@ int mnl_add_nl_group(struct mnl_socket *nl, unsigned int group)
 	return mnl_socket_bind(nl, group, MNL_SOCKET_AUTOPID);
 }
 
+/* Sequence number for next request, zero is reserved for kernel events */
+uint32_t mnlu_next_seq(void)
+{
+	static uint32_t seq;
+
+	if (++seq == 0)
+		seq = 1;
+	return seq;
+}
+
 struct nlmsghdr *mnlu_msg_prepare(void *buf, uint32_t nlmsg_type, uint16_t flags,
 				  void *extra_header, size_t extra_header_size)
 {
@@ -49,7 +65,7 @@ struct nlmsghdr *mnlu_msg_prepare(void *buf, uint32_t nlmsg_type, uint16_t flags
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = nlmsg_type;
 	nlh->nlmsg_flags = flags;
-	nlh->nlmsg_seq = time(NULL);
+	nlh->nlmsg_seq = mnlu_next_seq();
 
 	eh = mnl_nlmsg_put_extra_header(nlh, extra_header_size);
 	memcpy(eh, extra_header, extra_header_size);
@@ -102,6 +118,38 @@ static mnl_cb_t mnlu_cb_array[NLMSG_MIN_TYPE] = {
 	[NLMSG_OVERRUN]	= mnlu_cb_noop,
 };
 
+/*
+ * Like mnl_socket_recvfrom(), but discards datagrams that were
+ * not sent by the kernel.
+ */
+ssize_t mnlu_socket_recvfrom(const struct mnl_socket *nl, void *buf, size_t buf_size)
+{
+	struct sockaddr_nl addr;
+	struct iovec iov = {
+		.iov_base = buf,
+		.iov_len = buf_size,
+	};
+	struct msghdr msg = {
+		.msg_name = &addr,
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+	ssize_t ret;
+
+	do {
+		msg.msg_namelen = sizeof(addr);
+		ret = recvmsg(mnl_socket_get_fd(nl), &msg, 0);
+		if (ret < 0)
+			return ret;
+	} while (msg.msg_namelen != sizeof(addr) || addr.nl_pid != 0);
+
+	if (msg.msg_flags & MSG_TRUNC) {
+		errno = ENOSPC;
+		return -1;
+	}
+	return ret;
+}
+
 /* mnl_cb_run2() fails with EINTR on the first message with NLM_F_DUMP_INTR
  * and leaves the rest of the dump in the socket. Clear the flag, so that
  * the dump is read to its end, and tell the caller that it was there.
@@ -130,7 +178,7 @@ static int __mnlu_socket_recv_run(struct mnl_socket *nl, unsigned int seq,
 	int err;
 
 	do {
-		err = mnl_socket_recvfrom(nl, buf, buf_size);
+		err = mnlu_socket_recvfrom(nl, buf, buf_size);
 		if (err <= 0)
 			break;
 		if (intr)

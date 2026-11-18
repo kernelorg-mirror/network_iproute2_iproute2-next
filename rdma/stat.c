@@ -259,7 +259,7 @@ static int res_counter_line(struct rd *rd, const char *name, int index,
 
 	if (nla_line[RDMA_NLDEV_ATTR_RES_PID]) {
 		pid = mnl_attr_get_u32(nla_line[RDMA_NLDEV_ATTR_RES_PID]);
-		if (!get_task_name(pid, b, sizeof(b)))
+		if (!get_task_name(NULL, pid, b, sizeof(b)))
 			comm = b;
 	} else if (nla_line[RDMA_NLDEV_ATTR_RES_KERN_NAME]) {
 		/* discard const from mnl_attr_get_str */
@@ -735,7 +735,7 @@ static int stat_one_qp_unbind(struct rd *rd)
 	 * then rd_recv_msg() always return -1 here
 	 */
 	portid = mnl_socket_get_portid(rd->nl);
-	ret = mnl_socket_recvfrom(rd->nl, buf, sizeof(buf));
+	ret = mnlu_socket_recvfrom(rd->nl, buf, sizeof(buf));
 	if (ret <= 0)
 		return ret;
 

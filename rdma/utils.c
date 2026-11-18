@@ -685,7 +685,7 @@ int rd_exec_cmd(struct rd *rd, const struct rd_cmd *cmds, const char *str)
 
 void rd_prepare_msg(struct rd *rd, uint32_t cmd, uint32_t *seq, uint16_t flags)
 {
-	*seq = time(NULL);
+	*seq = mnlu_next_seq();
 
 	rd->nlh = mnl_nlmsg_put_header(rd->buff);
 	rd->nlh->nlmsg_type = RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, cmd);
@@ -795,8 +795,8 @@ void newline_indent(void)
 
 static int print_driver_string(const char *key_str, const char *val_str)
 {
-	print_string(PRINT_ANY, key_str, key_str, val_str);
-	print_string(PRINT_FP, NULL, " %s ", val_str);
+	print_string(PRINT_FP, NULL, "%s", key_str);
+	print_string(PRINT_ANY, key_str, " %s ", val_str);
 	return 0;
 }
 

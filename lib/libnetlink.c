@@ -15,7 +15,6 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #include <sys/uio.h>
 #include <linux/fib_rules.h>
 #include <linux/if_addrlabel.h>
@@ -193,6 +192,7 @@ void rtnl_close(struct rtnl_handle *rth)
 int rtnl_open_byproto(struct rtnl_handle *rth, unsigned int subscriptions,
 		      int protocol)
 {
+	const struct sockaddr_nl kernel_addr = { .nl_family = AF_NETLINK };
 	socklen_t addr_len;
 	int sndbuf = 32768;
 	int one = 1;
@@ -231,6 +231,13 @@ int rtnl_open_byproto(struct rtnl_handle *rth, unsigned int subscriptions,
 		perror("Cannot bind netlink socket");
 		goto err;
 	}
+
+	/* Refuse unicast from other processes, only the kernel may send */
+	if (connect(rth->fd, (struct sockaddr *)&kernel_addr,
+		    sizeof(kernel_addr)) < 0) {
+		perror("Cannot connect netlink socket");
+		goto err;
+	}
 	addr_len = sizeof(rth->local);
 	if (getsockname(rth->fd, (struct sockaddr *)&rth->local,
 			&addr_len) < 0) {
@@ -246,7 +253,6 @@ int rtnl_open_byproto(struct rtnl_handle *rth, unsigned int subscriptions,
 			rth->local.nl_family);
 		goto err;
 	}
-	rth->seq = time(NULL);
 	return 0;
 err:
 	rtnl_close(rth);
@@ -845,12 +851,22 @@ static int __rtnl_recvmsg(int fd, struct msghdr *msg, int flags)
 	return len;
 }
 
+/* Netlink datagrams from other processes are discarded */
+static bool rtnl_from_kernel(const struct msghdr *msg)
+{
+	const struct sockaddr_nl *nladdr = msg->msg_name;
+
+	return msg->msg_namelen == sizeof(*nladdr) && nladdr->nl_pid == 0;
+}
+
 static int rtnl_recvmsg(int fd, struct msghdr *msg, char **answer)
 {
 	struct iovec *iov = msg->msg_iov;
 	char *buf;
 	int len;
 
+again:
+	msg->msg_namelen = sizeof(struct sockaddr_nl);
 	iov->iov_base = NULL;
 	iov->iov_len = 0;
 
@@ -873,6 +889,11 @@ static int rtnl_recvmsg(int fd, struct msghdr *msg, char **answer)
 	if (len < 0) {
 		free(buf);
 		return len;
+	}
+
+	if (!rtnl_from_kernel(msg)) {
+		free(buf);
+		goto again;
 	}
 
 	if (answer)
@@ -907,8 +928,13 @@ static int rtnl_dump_filter_l(struct rtnl_handle *rth,
 		if (status < 0)
 			return status;
 
-		if (rth->dump_fp)
-			fwrite(buf, 1, NLMSG_ALIGN(status), rth->dump_fp);
+		if (rth->dump_fp) {
+			static const char pad[NLMSG_ALIGNTO];
+
+			/* rtnl_from_file() expects padded messages */
+			fwrite(buf, 1, status, rth->dump_fp);
+			fwrite(pad, 1, NLMSG_ALIGN(status) - status, rth->dump_fp);
+		}
 
 		for (a = arg; a->filter; a++) {
 			struct nlmsghdr *h = (struct nlmsghdr *)buf;
@@ -920,8 +946,7 @@ static int rtnl_dump_filter_l(struct rtnl_handle *rth,
 
 				h->nlmsg_flags &= ~a->nc_flags;
 
-				if (nladdr.nl_pid != 0 ||
-				    h->nlmsg_pid != rth->local.nl_pid ||
+				if (h->nlmsg_pid != rth->local.nl_pid ||
 				    h->nlmsg_seq != rth->dump)
 					goto skip_it;
 
@@ -974,7 +999,8 @@ skip_it:
 			fprintf(stderr, "Message truncated\n");
 			continue;
 		}
-		if (msglen) {
+		/* negative if the last message had no padding */
+		if (msglen > 0) {
 			fprintf(stderr, "!!!Remnant of size %d\n", msglen);
 			exit(1);
 		}
@@ -1068,36 +1094,13 @@ next:
 		if (status < 0)
 			return status;
 
-		if (msg.msg_namelen != sizeof(nladdr)) {
-			fprintf(stderr,
-				"sender address length == %d\n",
-				msg.msg_namelen);
-			exit(1);
-		}
-		for (h = (struct nlmsghdr *)buf; status >= sizeof(*h); ) {
-			int len = h->nlmsg_len;
-			int l = len - sizeof(*h);
+		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, status);
+		     h = NLMSG_NEXT(h, status)) {
+			int l = h->nlmsg_len - sizeof(*h);
 
-			if (l < 0 || len > status) {
-				if (msg.msg_flags & MSG_TRUNC) {
-					fprintf(stderr, "Truncated message\n");
-					free(buf);
-					return -1;
-				}
-				fprintf(stderr,
-					"!!!malformed message: len=%d\n",
-					len);
-				exit(1);
-			}
-
-			if (nladdr.nl_pid != 0 ||
-			    h->nlmsg_pid != rtnl->local.nl_pid ||
-			    h->nlmsg_seq > seq || h->nlmsg_seq < seq - iovlen) {
-				/* Don't forget to skip that message. */
-				status -= NLMSG_ALIGN(len);
-				h = (struct nlmsghdr *)((char *)h + NLMSG_ALIGN(len));
+			if (h->nlmsg_pid != rtnl->local.nl_pid ||
+			    (unsigned int)(seq - h->nlmsg_seq) >= iovlen)
 				continue;
-			}
 
 			if (h->nlmsg_type == NLMSG_ERROR) {
 				struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(h);
@@ -1143,20 +1146,22 @@ next:
 			}
 
 			fprintf(stderr, "Unexpected reply!!!\n");
-
-			status -= NLMSG_ALIGN(len);
-			h = (struct nlmsghdr *)((char *)h + NLMSG_ALIGN(len));
 		}
 		free(buf);
+
+		/* negative if the last message had no padding */
+		if (status > 0) {
+			if (msg.msg_flags & MSG_TRUNC) {
+				fprintf(stderr, "Truncated message\n");
+				return -1;
+			}
+			fprintf(stderr, "!!!Remnant of size %d\n", status);
+			exit(1);
+		}
 
 		if (msg.msg_flags & MSG_TRUNC) {
 			fprintf(stderr, "Message truncated\n");
 			continue;
-		}
-
-		if (status) {
-			fprintf(stderr, "!!!Remnant of size %d\n", status);
-			exit(1);
 		}
 	}
 }
@@ -1248,6 +1253,7 @@ int rtnl_listen(struct rtnl_handle *rtnl,
 		}
 
 		iov.iov_len = sizeof(buf);
+		msg.msg_namelen = sizeof(nladdr);
 		status = recvmsg(rtnl->fd, &msg, 0);
 
 		if (status < 0) {
@@ -1263,12 +1269,8 @@ int rtnl_listen(struct rtnl_handle *rtnl,
 			fprintf(stderr, "EOF on netlink\n");
 			return -1;
 		}
-		if (msg.msg_namelen != sizeof(nladdr)) {
-			fprintf(stderr,
-				"Sender address length == %d\n",
-				msg.msg_namelen);
-			exit(1);
-		}
+		if (!rtnl_from_kernel(&msg))
+			continue;
 
 		if (rtnl->flags & RTNL_HANDLE_F_LISTEN_ALL_NSID) {
 			memset(&ctrl, 0, sizeof(ctrl));
@@ -1284,37 +1286,28 @@ int rtnl_listen(struct rtnl_handle *rtnl,
 				}
 		}
 
-		for (h = (struct nlmsghdr *)buf; status >= sizeof(*h); ) {
+		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, status);
+		     h = NLMSG_NEXT(h, status)) {
 			int err;
-			int len = h->nlmsg_len;
-			int l = len - sizeof(*h);
-
-			if (l < 0 || len > status) {
-				if (msg.msg_flags & MSG_TRUNC) {
-					fprintf(stderr, "Truncated message\n");
-					return -1;
-				}
-				fprintf(stderr,
-					"!!!malformed message: len=%d\n",
-					len);
-				exit(1);
-			}
 
 			err = handler(&ctrl, h, jarg);
 			fflush(stdout);
 			if (err < 0)
 				return err;
+		}
 
-			status -= NLMSG_ALIGN(len);
-			h = (struct nlmsghdr *)((char *)h + NLMSG_ALIGN(len));
+		/* negative if the last message had no padding */
+		if (status > 0) {
+			if (msg.msg_flags & MSG_TRUNC) {
+				fprintf(stderr, "Truncated message\n");
+				return -1;
+			}
+			fprintf(stderr, "!!!Remnant of size %d\n", status);
+			exit(1);
 		}
 		if (msg.msg_flags & MSG_TRUNC) {
 			fprintf(stderr, "Message truncated\n");
 			continue;
-		}
-		if (status) {
-			fprintf(stderr, "!!!Remnant of size %d\n", status);
-			exit(1);
 		}
 	}
 }
@@ -1414,6 +1407,7 @@ int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data,
 	rta->rta_len = len;
 	if (alen)
 		memcpy(RTA_DATA(rta), data, alen);
+	memset((void *)rta + len, 0, RTA_ALIGN(len) - len);
 	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
 	return 0;
 }
@@ -1502,6 +1496,7 @@ int rta_addattr_l(struct rtattr *rta, int maxlen, int type,
 	subrta->rta_len = len;
 	if (alen)
 		memcpy(RTA_DATA(subrta), data, alen);
+	memset((void *)subrta + len, 0, RTA_ALIGN(len) - len);
 	rta->rta_len = NLMSG_ALIGN(rta->rta_len) + RTA_ALIGN(len);
 	return 0;
 }

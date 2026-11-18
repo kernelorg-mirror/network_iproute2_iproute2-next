@@ -1497,6 +1497,41 @@ static int ifa_label_match_rta(int ifindex, const struct rtattr *rta)
 	return fnmatch(filter.label, label, 0);
 }
 
+/* Aliases IFA_LOCAL and IFA_ADDRESS in the caller's table. */
+static bool ipaddr_filtered(const struct ifaddrmsg *ifa, struct rtattr **rta_tb,
+			    unsigned int ifa_flags)
+{
+	if (!rta_tb[IFA_LOCAL])
+		rta_tb[IFA_LOCAL] = rta_tb[IFA_ADDRESS];
+	if (!rta_tb[IFA_ADDRESS])
+		rta_tb[IFA_ADDRESS] = rta_tb[IFA_LOCAL];
+
+	if (filter.ifindex && filter.ifindex != ifa->ifa_index)
+		return true;
+	if ((filter.scope^ifa->ifa_scope)&filter.scopemask)
+		return true;
+	if ((filter.flags ^ ifa_flags) & filter.flagmask)
+		return true;
+
+	if (filter.family && filter.family != ifa->ifa_family)
+		return true;
+	if (filter.have_proto) {
+		__u8 proto = rta_tb[IFA_PROTO] ?
+			rta_getattr_u8(rta_tb[IFA_PROTO]) : IFAPROT_UNSPEC;
+
+		if (filter.proto != proto)
+			return true;
+	}
+
+	if (ifa_label_match_rta(ifa->ifa_index, rta_tb[IFA_LABEL]))
+		return true;
+
+	if (inet_addr_match_rta(&filter.pfx, rta_tb[IFA_LOCAL]))
+		return true;
+
+	return false;
+}
+
 int print_addrinfo(struct nlmsghdr *n, void *arg)
 {
 	FILE *fp = arg;
@@ -1528,28 +1563,7 @@ int print_addrinfo(struct nlmsghdr *n, void *arg)
 
 	ifa_flags = get_ifa_flags(ifa, rta_tb[IFA_FLAGS]);
 
-	if (!rta_tb[IFA_LOCAL])
-		rta_tb[IFA_LOCAL] = rta_tb[IFA_ADDRESS];
-	if (!rta_tb[IFA_ADDRESS])
-		rta_tb[IFA_ADDRESS] = rta_tb[IFA_LOCAL];
-
-	if (filter.ifindex && filter.ifindex != ifa->ifa_index)
-		return 0;
-	if ((filter.scope^ifa->ifa_scope)&filter.scopemask)
-		return 0;
-	if ((filter.flags ^ ifa_flags) & filter.flagmask)
-		return 0;
-
-	if (filter.family && filter.family != ifa->ifa_family)
-		return 0;
-	if (filter.have_proto && rta_tb[IFA_PROTO] &&
-	    filter.proto != rta_getattr_u8(rta_tb[IFA_PROTO]))
-		return 0;
-
-	if (ifa_label_match_rta(ifa->ifa_index, rta_tb[IFA_LABEL]))
-		return 0;
-
-	if (inet_addr_match_rta(&filter.pfx, rta_tb[IFA_LOCAL]))
+	if (ipaddr_filtered(ifa, rta_tb, ifa_flags))
 		return 0;
 
 	if (filter.flushb) {
@@ -1727,6 +1741,7 @@ static int print_selected_addrinfo(struct ifinfomsg *ifi,
 	for ( ; ainfo ;  ainfo = ainfo->next) {
 		struct nlmsghdr *n = &ainfo->h;
 		struct ifaddrmsg *ifa = NLMSG_DATA(n);
+		struct rtattr *rta_tb[IFA_MAX+1];
 
 		if (n->nlmsg_type != RTM_NEWADDR)
 			continue;
@@ -1742,6 +1757,11 @@ static int print_selected_addrinfo(struct ifinfomsg *ifi,
 			continue;
 
 		if (filter.down && ifi->ifi_flags&IFF_UP)
+			continue;
+
+		parse_rtattr(rta_tb, IFA_MAX, IFA_RTA(ifa), IFA_PAYLOAD(n));
+		if (ipaddr_filtered(ifa, rta_tb,
+				    get_ifa_flags(ifa, rta_tb[IFA_FLAGS])))
 			continue;
 
 		open_json_object(NULL);
@@ -1928,6 +1948,15 @@ static void ipaddr_filter(struct nlmsg_chain *linfo, struct nlmsg_chain *ainfo)
 
 			if ((filter.flags ^ ifa_flags) & filter.flagmask)
 				continue;
+
+			if (filter.have_proto) {
+				__u8 proto = tb[IFA_PROTO] ?
+					rta_getattr_u8(tb[IFA_PROTO]) :
+					IFAPROT_UNSPEC;
+
+				if (filter.proto != proto)
+					continue;
+			}
 
 			if (ifa_label_match_rta(ifa->ifa_index, tb[IFA_LABEL]))
 				continue;
@@ -2231,7 +2260,7 @@ static int ipaddr_list_flush_or_save(int argc, char **argv, int action)
 			__u8 proto;
 
 			NEXT_ARG();
-			if (get_u8(&proto, *argv, 0))
+			if (rtnl_addrprot_a2n(&proto, *argv))
 				invarg("\"proto\" value is invalid\n", *argv);
 			filter.have_proto = true;
 			filter.proto = proto;

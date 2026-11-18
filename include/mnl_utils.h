@@ -30,8 +30,10 @@ int mnlu_gen_socket_sndrcv_dump(struct mnlu_gen_socket *nlg,
 
 struct mnl_socket *mnlu_socket_open(int bus);
 int mnl_add_nl_group(struct mnl_socket *nl, unsigned int group);
+uint32_t mnlu_next_seq(void);
 struct nlmsghdr *mnlu_msg_prepare(void *buf, uint32_t nlmsg_type, uint16_t flags,
 				  void *extra_header, size_t extra_header_size);
+ssize_t mnlu_socket_recvfrom(const struct mnl_socket *nl, void *buf, size_t buf_size);
 int mnlu_socket_recv_run(struct mnl_socket *nl, unsigned int seq, void *buf, size_t buf_size,
 			 mnl_cb_t cb, void *data);
 int mnlu_gen_socket_recv_run(struct mnlu_gen_socket *nlg, mnl_cb_t cb,
