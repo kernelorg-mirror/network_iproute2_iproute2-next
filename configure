@@ -12,7 +12,7 @@ CONFIG=config.mk
 
 # Make a temp directory in build tree.
 TMPDIR=$(mktemp -d config.XXXXXX)
-trap 'status=$?; rm -rf $TMPDIR; exit $status' EXIT HUP INT QUIT TERM
+trap 'status=$?; rm -rf $TMPDIR; [ $status -ne 0 ] && rm -f $CONFIG; exit $status' EXIT HUP INT QUIT TERM
 
 check_toolchain()
 {
@@ -218,13 +218,14 @@ EOF
 check_elf()
 {
     if ${PKG_CONFIG} libelf --exists; then
-	echo "HAVE_ELF:=y" >>$CONFIG
 	echo "yes"
 
-	echo 'CFLAGS += -DHAVE_ELF' "$(${PKG_CONFIG} libelf --cflags)" >> $CONFIG
+	echo 'CFLAGS += ' "$(${PKG_CONFIG} libelf --cflags)" >> $CONFIG
 	echo 'LDLIBS += ' "$(${PKG_CONFIG} libelf --libs)" >>$CONFIG
     else
 	echo "no"
+	echo "	libelf is required, install libelf-dev or elfutils-libelf-devel"
+	exit 1
     fi
 }
 
@@ -232,10 +233,10 @@ have_libbpf_basic()
 {
     cat >$TMPDIR/libbpf_test.c <<EOF
 #include <bpf/libbpf.h>
+#if LIBBPF_MAJOR_VERSION < 1
+#error libbpf 1.0 or later is required
+#endif
 int main(int argc, char **argv) {
-    bpf_program__set_autoload(NULL, false);
-    bpf_map__ifindex(NULL);
-    bpf_map__set_pin_path(NULL, NULL);
     bpf_object__open_file(NULL, NULL);
     return 0;
 }
@@ -248,92 +249,28 @@ EOF
     return $ret
 }
 
-have_libbpf_sec_name()
-{
-    cat >$TMPDIR/libbpf_sec_test.c <<EOF
-#include <bpf/libbpf.h>
-int main(int argc, char **argv) {
-    void *ptr;
-    bpf_program__section_name(NULL);
-    return 0;
-}
-EOF
-
-    $CC -o $TMPDIR/libbpf_sec_test $TMPDIR/libbpf_sec_test.c $LIBBPF_CFLAGS $LIBBPF_LDLIBS >/dev/null 2>&1
-    local ret=$?
-
-    rm -f $TMPDIR/libbpf_sec_test.c $TMPDIR/libbpf_sec_test
-    return $ret
-}
-
-check_force_libbpf_on()
-{
-    # if set LIBBPF_FORCE=on but no libbpf support, just exist the config
-    # process to make sure we don't build without libbpf.
-    if [ "$LIBBPF_FORCE" = on ]; then
-        echo "	LIBBPF_FORCE=on set, but couldn't find a usable libbpf"
-        exit 1
-    fi
-}
-
 check_libbpf()
 {
-    # if set LIBBPF_FORCE=off, disable libbpf entirely
-    if [ "$LIBBPF_FORCE" = off ]; then
+    if ! ${PKG_CONFIG} libbpf --exists; then
         echo "no"
-        return
+        echo "	libbpf is required, install libbpf-dev or libbpf-devel"
+        echo "	or set PKG_CONFIG_PATH to point at a libbpf build"
+        exit 1
     fi
 
-    if ! ${PKG_CONFIG} libbpf --exists && [ -z "$LIBBPF_DIR" ] ; then
-        echo "no"
-        check_force_libbpf_on
-        return
-    fi
-
-    if [ $(uname -m) = x86_64 ]; then
-        local LIBBPF_LIBDIR="${LIBBPF_DIR}/usr/lib64"
-    else
-        local LIBBPF_LIBDIR="${LIBBPF_DIR}/usr/lib"
-    fi
-
-    if [ -n "$LIBBPF_DIR" ]; then
-        LIBBPF_CFLAGS="-I${LIBBPF_DIR}/usr/include"
-        LIBBPF_LDLIBS="${LIBBPF_LIBDIR}/libbpf.a -lz -lelf"
-        LIBBPF_VERSION=$(PKG_CONFIG_LIBDIR=${LIBBPF_LIBDIR}/pkgconfig ${PKG_CONFIG} libbpf --modversion)
-    else
-        LIBBPF_CFLAGS=$(${PKG_CONFIG} libbpf --cflags)
-        LIBBPF_LDLIBS=$(${PKG_CONFIG} libbpf --libs)
-        LIBBPF_VERSION=$(${PKG_CONFIG} libbpf --modversion)
-    fi
+    LIBBPF_CFLAGS=$(${PKG_CONFIG} libbpf --cflags)
+    LIBBPF_LDLIBS=$(${PKG_CONFIG} libbpf --libs)
+    LIBBPF_VERSION=$(${PKG_CONFIG} libbpf --modversion)
 
     if ! have_libbpf_basic; then
         echo "no"
-        echo "	libbpf version $LIBBPF_VERSION is too low, please update it to at least 0.1.0"
-        check_force_libbpf_on
-        return
-    else
-        echo "HAVE_LIBBPF:=y" >> $CONFIG
-        echo 'CFLAGS += -DHAVE_LIBBPF ' $LIBBPF_CFLAGS >> $CONFIG
-        echo "CFLAGS += -DLIBBPF_VERSION=\\\"$LIBBPF_VERSION\\\"" >> $CONFIG
-	LIBBPF_MAJOR=$(IFS="."; set $LIBBPF_VERSION; echo $1)
-	LIBBPF_MINOR=$(IFS="."; set $LIBBPF_VERSION; echo $2)
-	if [ "$LIBBPF_MAJOR" -eq 0 -a "$LIBBPF_MINOR" -lt 7 ]; then
-	    # Newer libbpf versions provide these defines in the bpf/libbpf_version.h header.
-            echo "CFLAGS += -DLIBBPF_MAJOR_VERSION=$LIBBPF_MAJOR -DLIBBPF_MINOR_VERSION=$LIBBPF_MINOR" >> $CONFIG
-	fi
-        echo 'LDLIBS += ' $LIBBPF_LDLIBS >> $CONFIG
-
-        if [ -z "$LIBBPF_DIR" ]; then
-            echo "CFLAGS += -DLIBBPF_DYNAMIC" >> $CONFIG
-        fi
+        echo "	libbpf version $LIBBPF_VERSION is too low, please update it to at least 1.0"
+        exit 1
     fi
 
-    # bpf_program__title() is deprecated since libbpf 0.2.0, use
-    # bpf_program__section_name() instead if we support
-    if have_libbpf_sec_name; then
-        echo "HAVE_LIBBPF_SECTION_NAME:=y" >> $CONFIG
-        echo 'CFLAGS += -DHAVE_LIBBPF_SECTION_NAME ' >> $CONFIG
-    fi
+    echo 'CFLAGS += ' $LIBBPF_CFLAGS >> $CONFIG
+    echo "CFLAGS += -DLIBBPF_VERSION=\\\"$LIBBPF_VERSION\\\"" >> $CONFIG
+    echo 'LDLIBS += ' $LIBBPF_LDLIBS >> $CONFIG
 
     echo "yes"
     echo "	libbpf version $LIBBPF_VERSION"
@@ -494,10 +431,6 @@ Usage: $0 [OPTIONS]
 					  always: color output is enabled regardless of stdout state
 	--include_dir <dir>		Path to iproute2 include dir
 	--libdir <dir>			Path to iproute2 lib dir
-	--libbpf_dir <dir>		Path to libbpf DESTDIR
-	--libbpf_force <on|off>		Enable/disable libbpf by force. Available options:
-					  on: require link against libbpf, quit config if no libbpf support
-					  off: disable libbpf probing
 	--prefix <dir>			Path prefix of the lib files to install
 	-h | --help			Show this usage info
 EOF
@@ -525,16 +458,12 @@ else
 				LIBDIR="$1" ;;
 			--libdir=*)
 				LIBDIR="${1#*=}" ;;
-			--libbpf_dir)
-				shift
-				LIBBPF_DIR="$1" ;;
-			--libbpf_dir=*)
-				LIBBPF_DIR="${1#*=}" ;;
-			--libbpf_force)
-				shift
-				LIBBPF_FORCE="$1" ;;
-			--libbpf_force=*)
-				LIBBPF_FORCE="${1#*=}" ;;
+			--libbpf_force | --libbpf_force=*)
+				echo "--libbpf_force is no longer supported, libbpf is required" >&2
+				exit 1 ;;
+			--libbpf_dir | --libbpf_dir=*)
+				echo "--libbpf_dir is no longer supported, set PKG_CONFIG_PATH instead" >&2
+				exit 1 ;;
 			--prefix)
 				shift
 				PREFIX="$1" ;;
@@ -558,14 +487,6 @@ case "$COLOR" in
 	*) usage 1 ;;
 esac
 [ -d "$INCLUDE" ] || usage 1
-if [ "${LIBBPF_DIR-unused}" != "unused" ]; then
-	[ -d "$LIBBPF_DIR" ] || usage 1
-fi
-if [ "${LIBBPF_FORCE-unused}" != "unused" ]; then
-	if [ "$LIBBPF_FORCE" != 'on' ] && [ "$LIBBPF_FORCE" != 'off' ]; then
-		usage 1
-	fi
-fi
 [ -z "$PREFIX" ] && usage 1
 [ -z "$LIBDIR" ] && usage 1
 

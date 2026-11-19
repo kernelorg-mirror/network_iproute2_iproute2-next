@@ -5,7 +5,7 @@
 /* Note:
  *
  * This file can be included into eBPF kernel programs. It contains
- * a couple of useful helper functions, map/section ABI (bpf_elf.h),
+ * a couple of useful helper functions, section names (bpf_elf.h),
  * misc macros and some eBPF specific LLVM built-ins.
  */
 
@@ -109,11 +109,6 @@ enum libbpf_pin_type {
 #ifndef __section_license
 # define __section_license						\
 	__section(ELF_SECTION_LICENSE)
-#endif
-
-#ifndef __section_maps
-# define __section_maps							\
-	__section(ELF_SECTION_MAPS)
 #endif
 
 /** Declaration helper macros. */

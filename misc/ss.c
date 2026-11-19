@@ -25,7 +25,6 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <ctype.h>
-#include <locale.h>
 
 #include "ss_util.h"
 #include "utils.h"
@@ -53,25 +52,10 @@
 #include <linux/tls.h>
 #include <linux/mptcp.h>
 
-#ifdef HAVE_LIBBPF
-/* If libbpf is new enough (0.6+), support for pretty-printing BPF socket-local
- * storage is enabled, otherwise we emit a warning and disable it.
- * ENABLE_BPF_SKSTORAGE_SUPPORT is only used to gate the socket-local storage
- * feature, so this wouldn't prevent any feature relying on HAVE_LIBBPF to be
- * usable.
- */
-#define ENABLE_BPF_SKSTORAGE_SUPPORT
-
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <linux/btf.h>
-
-#if ((LIBBPF_MAJOR_VERSION == 0) && (LIBBPF_MINOR_VERSION < 6))
-#warning "libbpf version 0.6 or later is required, disabling BPF socket-local storage support"
-#undef ENABLE_BPF_SKSTORAGE_SUPPORT
-#endif
-#endif
 
 #if HAVE_RPC
 #include <rpc/rpc.h>
@@ -107,6 +91,7 @@ static int show_proc_ctx;
 static int show_sock_ctx;
 static int show_header = 1;
 static int follow_events;
+static int sctp_ino;
 static int show_tipcinfo;
 static int show_tos;
 static int show_cgroup;
@@ -443,9 +428,6 @@ static void filter_af_set(struct filter *f, int af)
 
 static int filter_af_get(struct filter *f, int af)
 {
-	if (af < 0 || af >= 64)
-		return 0;
-
 	return !!(f->families & FAMILY_MASK(af));
 }
 
@@ -476,6 +458,17 @@ static void filter_merge_defaults(struct filter *f)
 	}
 }
 
+#define net_tcp_open()		generic_proc_open("PROC_NET_TCP", "net/tcp")
+#define net_tcp6_open()		generic_proc_open("PROC_NET_TCP6", "net/tcp6")
+#define net_udp_open()		generic_proc_open("PROC_NET_UDP", "net/udp")
+#define net_udp6_open()		generic_proc_open("PROC_NET_UDP6", "net/udp6")
+#define net_raw_open()		generic_proc_open("PROC_NET_RAW", "net/raw")
+#define net_raw6_open()		generic_proc_open("PROC_NET_RAW6", "net/raw6")
+#define net_unix_open()		generic_proc_open("PROC_NET_UNIX", "net/unix")
+#define net_packet_open()	generic_proc_open("PROC_NET_PACKET", \
+							"net/packet")
+#define net_netlink_open()	generic_proc_open("PROC_NET_NETLINK", \
+							"net/netlink")
 #define net_sockstat_open()	generic_proc_open("PROC_NET_SOCKSTAT", \
 							"net/sockstat")
 #define net_sockstat6_open()	generic_proc_open("PROC_NET_SOCKSTAT6", \
@@ -533,38 +526,6 @@ static void user_ent_add(unsigned int ino, char *task,
 
 #define MAX_PATH_LEN	1024
 
-/* The owner of a descriptor can point $PROC_ROOT/$ID/fd/$FD elsewhere
- * (e.g. at a file on a FUSE mount it serves) after readlink() saw a socket.
- * Pin the object and check it is still that socket before reading its label.
- * The check uses readlink(), which does not call into the filesystem of
- * the pinned object.
- */
-static int user_ent_sock_context(const char *path, unsigned int ino,
-				 char **context)
-{
-	unsigned int pinned;
-	char self[64];
-	char lnk[64];
-	ssize_t len;
-	int ret = -1;
-	int fd;
-
-	fd = open(path, O_PATH | O_CLOEXEC);
-	if (fd < 0)
-		return -1;
-
-	snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
-	len = readlink(self, lnk, sizeof(lnk) - 1);
-	if (len > 0) {
-		lnk[len] = '\0';
-		if (sscanf(lnk, "socket:[%u]", &pinned) == 1 && pinned == ino)
-			ret = getfilecon(self, context);
-	}
-
-	close(fd);
-	return ret;
-}
-
 static void user_ent_hash_build_task(char *path, int pid, int tid)
 {
 	const char *no_ctx = "unavailable";
@@ -612,20 +573,23 @@ static void user_ent_hash_build_task(char *path, int pid, int tid)
 		if (sscanf(lnk, "socket:[%u]", &ino) != 1)
 			continue;
 
-		if (!show_sock_ctx ||
-		    user_ent_sock_context(path, ino, &sock_context) <= 0)
+		if (getfilecon(path, &sock_context) <= 0)
 			sock_context = strdup(no_ctx);
 
 		if (task[0] == '\0') {
-			char task_root[MAX_PATH_LEN];
+			char stat[MAX_PATH_LEN];
 			char name[16];
+			FILE *fp;
 
-			/* $PROC_ROOT/$PID/task/$TID/comm */
-			snprintf(task_root, sizeof(task_root), "%s/%d/task",
-				 getenv("PROC_ROOT") ? : "/proc", pid);
+			strlcpy(stat, path, pos_id + 1);
+			snprintf(stat + pos_id, sizeof(stat) - pos_id, "stat");
 
-			if (get_task_name(task_root, tid, name, sizeof(name)) == 0)
-				escape_str(task, name, sizeof(task));
+			fp = fopen(stat, "r");
+			if (fp) {
+				if (fscanf(fp, "%*d (%[^)])", name) == 1)
+					escape_str(task, name, sizeof(task));
+				fclose(fp);
+			}
 		}
 
 		user_ent_add(ino, task, pid, tid, fd, task_context, sock_context);
@@ -798,15 +762,7 @@ static unsigned long long cookie_sk_get(const uint32_t *cookie)
 	return (((unsigned long long)cookie[1] << 31) << 1) | cookie[0];
 }
 
-/* Names indexed by a value from the kernel, which may be out of range */
-static const char *table_name(const char * const *names, size_t n,
-			      unsigned int i)
-{
-	return i < n && names[i] ? names[i] : "UNKNOWN";
-}
-#define TABLE_NAME(names, i)	table_name(names, ARRAY_SIZE(names), i)
-
-static const char * const sctp_sstate_name[] = {
+static const char *sctp_sstate_name[] = {
 	[SCTP_STATE_CLOSED] = "CLOSED",
 	[SCTP_STATE_COOKIE_WAIT] = "COOKIE_WAIT",
 	[SCTP_STATE_COOKIE_ECHOED] = "COOKIE_ECHOED",
@@ -845,7 +801,6 @@ struct sockstat {
 	char *peer_name;
 	__u32		    mark;
 	__u64		    cgroup_id;
-	bool		    sctp_assoc;
 };
 
 struct dctcpstat {
@@ -920,6 +875,18 @@ struct tcpstat {
 	struct dctcpstat    *dctcp;
 	struct tcp_bbr_info *bbr_info;
 };
+
+/* SCTP assocs share the same inode number with their parent endpoint. So if we
+ * have seen the inode number before, it must be an assoc instead of the next
+ * endpoint. */
+static bool is_sctp_assoc(struct sockstat *s, const char *sock_name)
+{
+	if (strcmp(sock_name, "sctp"))
+		return false;
+	if (!sctp_ino || sctp_ino != s->ino)
+		return false;
+	return true;
+}
 
 static const char *unix_netid_name(int type)
 {
@@ -1466,14 +1433,14 @@ static void sock_state_print(struct sockstat *s)
 		sock_name = "unknown";
 	}
 
-	if (s->sctp_assoc) {
+	if (is_sctp_assoc(s, sock_name)) {
 		field_set(COL_STATE);		/* Empty Netid field */
-		out("`- %s", TABLE_NAME(sctp_sstate_name, s->state));
+		out("`- %s", sctp_sstate_name[s->state]);
 	} else {
 		field_set(COL_NETID);
 		out("%s", sock_name);
 		field_set(COL_STATE);
-		out("%s", TABLE_NAME(sstate_name, s->state));
+		out("%s", sstate_name[s->state]);
 	}
 
 	if (show_queues) {
@@ -1592,45 +1559,37 @@ static void init_service_resolver(void)
 		return;
 
 	for (; rhead; rhead = rhead->rpcb_next) {
-		const char *proto;
-		char prog[128];
+		char prog[128] = "rpc.";
 		struct scache *c;
-		int hport, lport;
-
-		if (sscanf(rhead->rpcb_map.r_addr, "::.%d.%d",
-			   &hport, &lport) != 2 &&
-		    sscanf(rhead->rpcb_map.r_addr, "0.0.0.0.%d.%d",
-			   &hport, &lport) != 2)
-			continue;
-
-		if (strcmp(rhead->rpcb_map.r_netid, TCP_PROTO) == 0 ||
-		    strcmp(rhead->rpcb_map.r_netid, TCP6_PROTO) == 0)
-			proto = TCP_PROTO;
-		else if (strcmp(rhead->rpcb_map.r_netid, UDP_PROTO) == 0 ||
-			 strcmp(rhead->rpcb_map.r_netid, UDP6_PROTO) == 0)
-			proto = UDP_PROTO;
-		else if (strcmp(rhead->rpcb_map.r_netid, SCTP_PROTO) == 0)
-			proto = SCTP_PROTO;
-		else
-			continue;
-
-		rpc = getrpcbynumber(rhead->rpcb_map.r_prog);
-		if (rpc)
-			snprintf(prog, sizeof(prog), "rpc.%s", rpc->r_name);
-		else
-			snprintf(prog, sizeof(prog), "rpc.%lu",
-				 (unsigned long)rhead->rpcb_map.r_prog);
+		int hport, lport, ok;
 
 		c = malloc(sizeof(*c));
 		if (!c)
 			continue;
 
-		c->port = hport << 8 | lport;
-		c->proto = proto;
-		c->name = strdup(prog);
-		if (!c->name) {
-			free(c);
+		ok = sscanf(rhead->rpcb_map.r_addr, "::.%d.%d", &hport, &lport);
+		if (!ok)
+			ok = sscanf(rhead->rpcb_map.r_addr, "0.0.0.0.%d.%d",
+				    &hport, &lport);
+		if (!ok)
 			continue;
+		c->port = hport << 8 | lport;
+
+		if (strcmp(rhead->rpcb_map.r_netid, TCP_PROTO) == 0 ||
+		    strcmp(rhead->rpcb_map.r_netid, TCP6_PROTO) == 0)
+			c->proto = TCP_PROTO;
+		else if (strcmp(rhead->rpcb_map.r_netid, UDP_PROTO) == 0 ||
+			 strcmp(rhead->rpcb_map.r_netid, UDP6_PROTO) == 0)
+			c->proto = UDP_PROTO;
+		else if (strcmp(rhead->rpcb_map.r_netid, SCTP_PROTO) == 0)
+			c->proto = SCTP_PROTO;
+		else
+			continue;
+
+		rpc = getrpcbynumber(rhead->rpcb_map.r_prog);
+		if (rpc) {
+			strncat(prog, rpc->r_name, 128 - strlen(prog));
+			c->name = strdup(prog);
 		}
 
 		c->next = rlist;
@@ -2507,6 +2466,55 @@ static void inet_stats_print(struct sockstat *s, bool v6only)
 	proc_ctx_print(s);
 }
 
+static int proc_parse_inet_addr(char *loc, char *rem, int family, struct
+		sockstat * s)
+{
+	s->local.family = s->remote.family = family;
+	if (family == AF_INET) {
+		sscanf(loc, "%x:%lx", s->local.data, (unsigned long *)&s->lport);
+		sscanf(rem, "%x:%lx", s->remote.data, (unsigned long *)&s->rport);
+		s->local.bytelen = s->remote.bytelen = 4;
+		return 0;
+	} else {
+		sscanf(loc, "%08x%08x%08x%08x:%lx",
+		       s->local.data,
+		       s->local.data + 1,
+		       s->local.data + 2,
+		       s->local.data + 3,
+		       (unsigned long *)&s->lport);
+		sscanf(rem, "%08x%08x%08x%08x:%lx",
+		       s->remote.data,
+		       s->remote.data + 1,
+		       s->remote.data + 2,
+		       s->remote.data + 3,
+		       (unsigned long *)&s->rport);
+		s->local.bytelen = s->remote.bytelen = 16;
+		return 0;
+	}
+	return -1;
+}
+
+static int proc_inet_split_line(char *line, char **loc, char **rem, char **data)
+{
+	char *p;
+
+	if ((p = strchr(line, ':')) == NULL)
+		return -1;
+
+	*loc = p+2;
+	if ((p = strchr(*loc, ':')) == NULL)
+		return -1;
+
+	p[5] = 0;
+	*rem = p+6;
+	if ((p = strchr(*rem, ':')) == NULL)
+		return -1;
+
+	p[5] = 0;
+	*data = p+6;
+	return 0;
+}
+
 /*
  * Display bandwidth in standard units
  * See: https://en.wikipedia.org/wiki/Data-rate_units
@@ -2535,7 +2543,7 @@ static void sctp_stats_print(struct sctp_info *s)
 	if (s->sctpi_tag)
 		out(" tag:%x", s->sctpi_tag);
 	if (s->sctpi_state)
-		out(" state:%s", TABLE_NAME(sctp_sstate_name, s->sctpi_state));
+		out(" state:%s", sctp_sstate_name[s->sctpi_state]);
 	if (s->sctpi_rwnd)
 		out(" rwnd:%d", s->sctpi_rwnd);
 	if (s->sctpi_unackdata)
@@ -2773,6 +2781,98 @@ static void sctp_timer_print(struct tcpstat *s)
 	if (s->timer)
 		out(" timer:(T3_RTX,%s,%d)",
 		    print_ms_timer(s->timeout), s->retrans);
+}
+
+static int tcp_show_line(char *line, const struct filter *f, int family)
+{
+	int rto = 0, ato = 0;
+	struct tcpstat s = {};
+	char *loc, *rem, *data;
+	char opt[256];
+	int n;
+	int hz = get_user_hz();
+
+	if (proc_inet_split_line(line, &loc, &rem, &data))
+		return -1;
+
+	int state = (data[1] >= 'A') ? (data[1] - 'A' + 10) : (data[1] - '0');
+
+	if (!(f->states & (1 << state)))
+		return 0;
+
+	proc_parse_inet_addr(loc, rem, family, &s.ss);
+
+	if (f->f && run_ssfilter(f->f, &s.ss) == 0)
+		return 0;
+
+	opt[0] = 0;
+	n = sscanf(data, "%x %x:%x %x:%x %x %d %d %u %d %llx %d %d %d %u %d %[^\n]\n",
+		   &s.ss.state, &s.ss.wq, &s.ss.rq,
+		   &s.timer, &s.timeout, &s.retrans, &s.ss.uid, &s.probes,
+		   &s.ss.ino, &s.ss.refcnt, &s.ss.sk, &rto, &ato, &s.qack, &s.cwnd,
+		   &s.ssthresh, opt);
+
+	if (n < 17)
+		opt[0] = 0;
+
+	if (n < 12) {
+		rto = 0;
+		s.cwnd = 2;
+		s.ssthresh = -1;
+		ato = s.qack = 0;
+	}
+
+	s.retrans   = s.timer != 1 ? s.probes : s.retrans;
+	s.timeout   = (s.timeout * 1000 + hz - 1) / hz;
+	s.ato	    = (double)ato / hz;
+	s.qack	   /= 2;
+	s.rto	    = (double)rto;
+	s.ssthresh  = s.ssthresh == -1 ? 0 : s.ssthresh;
+	s.rto	    = s.rto != 3 * hz  ? s.rto / hz : 0;
+	s.ss.type   = IPPROTO_TCP;
+
+	inet_stats_print(&s.ss, false);
+
+	if (show_options)
+		tcp_timer_print(&s);
+
+	if (show_details) {
+		sock_details_print(&s.ss);
+		if (opt[0])
+			out(" opt:\"%s\"", opt);
+	}
+
+	if (show_tcpinfo)
+		tcp_stats_print(&s);
+
+	return 0;
+}
+
+static int generic_record_read(FILE *fp,
+			       int (*worker)(char*, const struct filter *, int),
+			       const struct filter *f, int fam)
+{
+	char line[256];
+
+	/* skip header */
+	if (fgets(line, sizeof(line), fp) == NULL)
+		goto outerr;
+
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		int n = strlen(line);
+
+		if (n == 0 || line[n-1] != '\n') {
+			errno = -EINVAL;
+			return -1;
+		}
+		line[n-1] = 0;
+
+		if (worker(line, f, fam) < 0)
+			return 0;
+	}
+outerr:
+
+	return ferror(fp) ? -1 : 0;
 }
 
 static void print_skmeminfo(struct rtattr *tb[], int attrtype)
@@ -3329,8 +3429,6 @@ static void parse_diag_msg(struct nlmsghdr *nlh, struct sockstat *s)
 	memcpy(s->remote.data, r->id.idiag_dst, s->local.bytelen);
 }
 
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
-
 #define MAX_NR_BPF_MAP_ID_OPTS 32
 
 struct btf;
@@ -3640,7 +3738,6 @@ static bool bpf_map_opts_is_enabled(void)
 {
 	return bpf_map_opts.nr_maps || bpf_map_opts.show_all;
 }
-#endif
 
 static int inet_show_sock(struct nlmsghdr *nlh,
 			  struct sockstat *s)
@@ -3658,12 +3755,6 @@ static int inet_show_sock(struct nlmsghdr *nlh,
 
 	if (s->local.family == AF_INET6 && tb[INET_DIAG_SKV6ONLY])
 		v6only = rta_getattr_u8(tb[INET_DIAG_SKV6ONLY]);
-
-	/* SCTP assocs share the inode number of their endpoint; only
-	 * assocs carry INET_DIAG_PEERS, and only for those is the state
-	 * an SCTP_STATE_* value.
-	 */
-	s->sctp_assoc = s->type == IPPROTO_SCTP && tb[INET_DIAG_PEERS];
 
 	inet_stats_print(s, v6only);
 
@@ -3752,11 +3843,82 @@ static int inet_show_sock(struct nlmsghdr *nlh,
 		else
 			tcp_show_info(nlh, r, tb);
 	}
+	sctp_ino = s->ino;
 
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 	if (tb[INET_DIAG_SK_BPF_STORAGES])
 		show_sk_bpf_storages(tb[INET_DIAG_SK_BPF_STORAGES]);
-#endif
+
+	return 0;
+}
+
+static int tcpdiag_send(int fd, int protocol, struct filter *f)
+{
+	struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
+	struct {
+		struct nlmsghdr nlh;
+		struct inet_diag_req r;
+	} req = {
+		.nlh.nlmsg_len = sizeof(req),
+		.nlh.nlmsg_flags = NLM_F_ROOT | NLM_F_MATCH | NLM_F_REQUEST,
+		.nlh.nlmsg_seq = MAGIC_SEQ,
+		.r.idiag_family = AF_INET,
+		.r.idiag_states = f->states,
+	};
+	char    *bc = NULL;
+	int	bclen;
+	struct msghdr msg;
+	struct rtattr rta;
+	struct iovec iov[3];
+	int iovlen = 1;
+
+	if (protocol == IPPROTO_TCP)
+		req.nlh.nlmsg_type = TCPDIAG_GETSOCK;
+	else
+		return -1;
+
+	if (show_mem) {
+		req.r.idiag_ext |= (1<<(INET_DIAG_MEMINFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_SKMEMINFO-1));
+	}
+
+	if (show_tcpinfo) {
+		req.r.idiag_ext |= (1<<(INET_DIAG_INFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_VEGASINFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_CONG-1));
+	}
+
+	if (show_tos) {
+		req.r.idiag_ext |= (1<<(INET_DIAG_TOS-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_TCLASS-1));
+	}
+
+	iov[0] = (struct iovec){
+		.iov_base = &req,
+		.iov_len = sizeof(req)
+	};
+	if (f->f) {
+		bclen = ssfilter_bytecompile(f->f, &bc);
+		if (bclen) {
+			rta.rta_type = INET_DIAG_REQ_BYTECODE;
+			rta.rta_len = RTA_LENGTH(bclen);
+			iov[1] = (struct iovec){ &rta, sizeof(rta) };
+			iov[2] = (struct iovec){ bc, bclen };
+			req.nlh.nlmsg_len += RTA_LENGTH(bclen);
+			iovlen = 3;
+		}
+	}
+
+	msg = (struct msghdr) {
+		.msg_name = (void *)&nladdr,
+		.msg_namelen = sizeof(nladdr),
+		.msg_iov = iov,
+		.msg_iovlen = iovlen,
+	};
+
+	if (sendmsg(fd, &msg, 0) < 0) {
+		close(fd);
+		return -1;
+	}
 
 	return 0;
 }
@@ -3774,6 +3936,9 @@ static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
 	struct rtattr rta_proto;
 	struct iovec iov[6];
 	int iovlen = 1;
+
+	if (family == PF_UNSPEC)
+		return tcpdiag_send(fd, protocol, f);
 
 	memset(&req.r, 0, sizeof(req.r));
 	req.r.sdiag_family = family;
@@ -3822,7 +3987,6 @@ static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
 		iovlen += 2;
 	}
 
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 	if (bpf_map_opts_is_enabled()) {
 		bpf_rta = bpf_map_opts_alloc_rta();
 		if (!bpf_rta) {
@@ -3834,7 +3998,6 @@ static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
 		iov[iovlen++] = (struct iovec){ bpf_rta, bpf_rta->rta_len };
 		req.nlh.nlmsg_len += bpf_rta->rta_len;
 	}
-#endif
 
 	msg = (struct msghdr) {
 		.msg_name = (void *)&nladdr,
@@ -3845,6 +4008,7 @@ static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
 
 	if (sendmsg(fd, &msg, 0) < 0) {
 		free(bpf_rta);
+		close(fd);
 		return -1;
 	}
 
@@ -3952,8 +4116,13 @@ again:
 	if ((err = sockdiag_send(family, rth.fd, protocol, f)))
 		goto Exit;
 
-	if ((err = rtnl_dump_filter(&rth, show_one_inet_sock, &arg)))
+	if ((err = rtnl_dump_filter(&rth, show_one_inet_sock, &arg))) {
+		if (family != PF_UNSPEC) {
+			family = PF_UNSPEC;
+			goto again;
+		}
 		goto Exit;
+	}
 	if (family == PF_INET && preferred_family != PF_INET) {
 		family = PF_INET6;
 		goto again;
@@ -3968,9 +4137,8 @@ Exit:
 
 static int tcp_show_netlink_file(struct filter *f)
 {
-	struct nlmsghdr *h = NULL;
-	size_t buflen = 0;
 	FILE	*fp;
+	char	buf[16384];
 	int	err = -1;
 
 	if ((fp = fopen(getenv("TCPDIAG_FILE"), "r")) == NULL) {
@@ -3981,58 +4149,34 @@ static int tcp_show_netlink_file(struct filter *f)
 	while (1) {
 		int err2;
 		size_t status, nitems;
-		struct nlmsghdr hdr;
+		struct nlmsghdr *h = (struct nlmsghdr *)buf;
 		struct sockstat s = {};
 
-		status = fread(&hdr, 1, sizeof(hdr), fp);
-		if (status != sizeof(hdr)) {
+		status = fread(buf, 1, sizeof(*h), fp);
+		if (status != sizeof(*h)) {
 			if (ferror(fp))
 				perror("Reading header from $TCPDIAG_FILE");
-			else if (status || err)
-				fprintf(stderr, "Unexpected EOF reading $TCPDIAG_FILE\n");
+			if (feof(fp))
+				fprintf(stderr, "Unexpected EOF reading $TCPDIAG_FILE");
 			break;
 		}
 
-		/* NLMSG_ALIGN() is u32 arithmetic and wraps near UINT_MAX,
-		 * which would size the buffer below the record.
-		 */
-		if (hdr.nlmsg_len < sizeof(hdr) ||
-		    hdr.nlmsg_len > UINT32_MAX - NLMSG_ALIGNTO + 1) {
-			fprintf(stderr, "Malformed message in $TCPDIAG_FILE: len=%u\n",
-				hdr.nlmsg_len);
-			break;
-		}
-
-		if (NLMSG_ALIGN(hdr.nlmsg_len) > buflen) {
-			void *nbuf = realloc(h, NLMSG_ALIGN(hdr.nlmsg_len));
-
-			if (!nbuf) {
-				perror("Reading $TCPDIAG_FILE");
-				break;
-			}
-			h = nbuf;
-			buflen = NLMSG_ALIGN(hdr.nlmsg_len);
-		}
-		*h = hdr;
-
-		nitems = NLMSG_ALIGN(h->nlmsg_len) - sizeof(*h);
+		nitems = NLMSG_ALIGN(h->nlmsg_len - sizeof(*h));
 		status = fread(h+1, 1, nitems, fp);
 
 		if (status != nitems) {
 			if (ferror(fp))
 				perror("Reading $TCPDIAG_FILE");
 			if (feof(fp))
-				fprintf(stderr, "Unexpected EOF reading $TCPDIAG_FILE\n");
-			err = -1;
+				fprintf(stderr, "Unexpected EOF reading $TCPDIAG_FILE");
 			break;
 		}
 
-		/* One dump per address family; the file ends after a DONE */
+		/* The only legal exit point */
 		if (h->nlmsg_type == NLMSG_DONE) {
 			err = 0;
-			continue;
+			break;
 		}
-		err = -1;
 
 		if (h->nlmsg_type == NLMSG_ERROR) {
 			struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(h);
@@ -4046,17 +4190,8 @@ static int tcp_show_netlink_file(struct filter *f)
 			break;
 		}
 
-		if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg))) {
-			fprintf(stderr, "Malformed message in $TCPDIAG_FILE: len=%u\n",
-				h->nlmsg_len);
-			break;
-		}
-
 		parse_diag_msg(h, &s);
 		s.type = IPPROTO_TCP;
-
-		if (f && !filter_af_get(f, s.local.family))
-			continue;
 
 		if (f && f->f && run_ssfilter(f->f, &s) == 0)
 			continue;
@@ -4068,25 +4203,16 @@ static int tcp_show_netlink_file(struct filter *f)
 		}
 	}
 
-	free(h);
 	fclose(fp);
 	return err;
 }
 
-static int sock_diag_error(const char *what)
-{
-	if (errno == ENOENT || errno == EOPNOTSUPP)
-		fprintf(stderr,
-			"Cannot dump %s sockets: kernel lacks sock_diag support\n",
-			what);
-	else
-		fprintf(stderr, "Cannot dump %s sockets: %s\n",
-			what, strerror(errno));
-	return -1;
-}
-
 static int tcp_show(struct filter *f)
 {
+	FILE *fp = NULL;
+	char *buf = NULL;
+	int bufsize = 1024*1024;
+
 	if (!filter_af_get(f, AF_INET) && !filter_af_get(f, AF_INET6))
 		return 0;
 
@@ -4095,9 +4221,52 @@ static int tcp_show(struct filter *f)
 	if (getenv("TCPDIAG_FILE"))
 		return tcp_show_netlink_file(f);
 
-	if (inet_show_netlink(f, NULL, IPPROTO_TCP))
-		return sock_diag_error("TCP");
+	if (!getenv("PROC_NET_TCP") && !getenv("PROC_ROOT")
+	    && inet_show_netlink(f, NULL, IPPROTO_TCP) == 0)
+		return 0;
+
+	/* Sigh... We have to parse /proc/net/tcp... */
+	while (bufsize >= 64*1024) {
+		if ((buf = malloc(bufsize)) != NULL)
+			break;
+		bufsize /= 2;
+	}
+	if (buf == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	if (f->families & FAMILY_MASK(AF_INET)) {
+		if ((fp = net_tcp_open()) == NULL)
+			goto outerr;
+
+		setbuffer(fp, buf, bufsize);
+		if (generic_record_read(fp, tcp_show_line, f, AF_INET))
+			goto outerr;
+		fclose(fp);
+	}
+
+	if ((f->families & FAMILY_MASK(AF_INET6)) &&
+	    (fp = net_tcp6_open()) != NULL) {
+		setbuffer(fp, buf, bufsize);
+		if (generic_record_read(fp, tcp_show_line, f, AF_INET6))
+			goto outerr;
+		fclose(fp);
+	}
+
+	free(buf);
 	return 0;
+
+outerr:
+	do {
+		int saved_errno = errno;
+
+		free(buf);
+		if (fp)
+			fclose(fp);
+		errno = saved_errno;
+		return -1;
+	} while (0);
 }
 
 static int mptcp_show(struct filter *f)
@@ -4105,8 +4274,10 @@ static int mptcp_show(struct filter *f)
 	if (!filter_af_get(f, AF_INET) && !filter_af_get(f, AF_INET6))
 		return 0;
 
-	if (inet_show_netlink(f, NULL, IPPROTO_MPTCP))
-		return sock_diag_error("MPTCP");
+	if (!getenv("PROC_NET_MPTCP") && !getenv("PROC_ROOT")
+	    && inet_show_netlink(f, NULL, IPPROTO_MPTCP) == 0)
+		return 0;
+
 	return 0;
 }
 
@@ -4115,33 +4286,140 @@ static int sctp_show(struct filter *f)
 	if (!filter_af_get(f, AF_INET) && !filter_af_get(f, AF_INET6))
 		return 0;
 
-	if (inet_show_netlink(f, NULL, IPPROTO_SCTP))
-		return sock_diag_error("SCTP");
+	if (!getenv("PROC_NET_SCTP") && !getenv("PROC_ROOT")
+	    && inet_show_netlink(f, NULL, IPPROTO_SCTP) == 0)
+		return 0;
+
+	return 0;
+}
+
+static int dgram_show_line(char *line, const struct filter *f, int family)
+{
+	struct sockstat s = {};
+	char *loc, *rem, *data;
+	char opt[256];
+	int n;
+
+	if (proc_inet_split_line(line, &loc, &rem, &data))
+		return -1;
+
+	int state = (data[1] >= 'A') ? (data[1] - 'A' + 10) : (data[1] - '0');
+
+	if (!(f->states & (1 << state)))
+		return 0;
+
+	proc_parse_inet_addr(loc, rem, family, &s);
+
+	if (f->f && run_ssfilter(f->f, &s) == 0)
+		return 0;
+
+	opt[0] = 0;
+	n = sscanf(data, "%x %x:%x %*x:%*x %*x %d %*d %u %d %llx %[^\n]\n",
+	       &s.state, &s.wq, &s.rq,
+	       &s.uid, &s.ino,
+	       &s.refcnt, &s.sk, opt);
+
+	if (n < 9)
+		opt[0] = 0;
+
+	s.type = dg_proto == UDP_PROTO ? IPPROTO_UDP : 0;
+	inet_stats_print(&s, false);
+
+	if (show_details && opt[0])
+		out(" opt:\"%s\"", opt);
+
 	return 0;
 }
 
 static int udp_show(struct filter *f)
 {
+	FILE *fp = NULL;
+
 	if (!filter_af_get(f, AF_INET) && !filter_af_get(f, AF_INET6))
 		return 0;
 
 	dg_proto = UDP_PROTO;
 
-	if (inet_show_netlink(f, NULL, IPPROTO_UDP))
-		return sock_diag_error("UDP");
+	if (!getenv("PROC_NET_UDP") && !getenv("PROC_ROOT")
+	    && inet_show_netlink(f, NULL, IPPROTO_UDP) == 0)
+		return 0;
+
+	if (f->families&FAMILY_MASK(AF_INET)) {
+		if ((fp = net_udp_open()) == NULL)
+			goto outerr;
+		if (generic_record_read(fp, dgram_show_line, f, AF_INET))
+			goto outerr;
+		fclose(fp);
+	}
+
+	if ((f->families&FAMILY_MASK(AF_INET6)) &&
+	    (fp = net_udp6_open()) != NULL) {
+		if (generic_record_read(fp, dgram_show_line, f, AF_INET6))
+			goto outerr;
+		fclose(fp);
+	}
 	return 0;
+
+outerr:
+	do {
+		int saved_errno = errno;
+
+		if (fp)
+			fclose(fp);
+		errno = saved_errno;
+		return -1;
+	} while (0);
 }
 
 static int raw_show(struct filter *f)
 {
+	FILE *fp = NULL;
+
 	if (!filter_af_get(f, AF_INET) && !filter_af_get(f, AF_INET6))
 		return 0;
 
 	dg_proto = RAW_PROTO;
 
-	if (inet_show_netlink(f, NULL, IPPROTO_RAW))
-		return sock_diag_error("RAW");
+	if (!getenv("PROC_NET_RAW") && !getenv("PROC_ROOT") &&
+	    inet_show_netlink(f, NULL, IPPROTO_RAW) == 0)
+		return 0;
+
+	if (f->families&FAMILY_MASK(AF_INET)) {
+		if ((fp = net_raw_open()) == NULL)
+			goto outerr;
+		if (generic_record_read(fp, dgram_show_line, f, AF_INET))
+			goto outerr;
+		fclose(fp);
+	}
+
+	if ((f->families&FAMILY_MASK(AF_INET6)) &&
+	    (fp = net_raw6_open()) != NULL) {
+		if (generic_record_read(fp, dgram_show_line, f, AF_INET6))
+			goto outerr;
+		fclose(fp);
+	}
 	return 0;
+
+outerr:
+	do {
+		int saved_errno = errno;
+
+		if (fp)
+			fclose(fp);
+		errno = saved_errno;
+		return -1;
+	} while (0);
+}
+
+#define MAX_UNIX_REMEMBER (1024*1024/sizeof(struct sockstat))
+
+static void unix_list_drop_first(struct sockstat **list)
+{
+	struct sockstat *s = *list;
+
+	(*list) = (*list)->next;
+	free(s->name);
+	free(s);
 }
 
 static bool unix_type_skip(struct sockstat *s, struct filter *f)
@@ -4158,13 +4436,10 @@ static bool unix_type_skip(struct sockstat *s, struct filter *f)
 static void unix_stats_print(struct sockstat *s, struct filter *f)
 {
 	char port_name[30] = {};
-	char name[128];
 
 	sock_state_print(s);
 
-	/* name is chosen by whoever bound the socket, may contain newlines */
-	escape_str(name, s->name ?: "*", sizeof(name));
-	sock_addr_print(name, " ",
+	sock_addr_print(s->name ?: "*", " ",
 			uint_to_str(s->lport, port_name), NULL);
 	sock_addr_print(s->peer_name ?: "*", " ",
 			uint_to_str(s->rport, port_name), NULL);
@@ -4289,11 +4564,134 @@ static int unix_show_netlink(struct filter *f)
 
 static int unix_show(struct filter *f)
 {
+	FILE *fp;
+	char buf[256];
+	char name[128];
+	int  newformat = 0;
+	int  cnt;
+	struct sockstat *list = NULL;
+	const int unix_state_map[] = { SS_CLOSE, SS_SYN_SENT,
+				       SS_ESTABLISHED, SS_CLOSING };
+
 	if (!filter_af_get(f, AF_UNIX))
 		return 0;
 
-	if (unix_show_netlink(f))
-		return sock_diag_error("UNIX");
+	if (!getenv("PROC_NET_UNIX") && !getenv("PROC_ROOT")
+	    && unix_show_netlink(f) == 0)
+		return 0;
+
+	if ((fp = net_unix_open()) == NULL)
+		return -1;
+	if (!fgets(buf, sizeof(buf), fp)) {
+		fclose(fp);
+		return -1;
+	}
+
+	if (memcmp(buf, "Peer", 4) == 0)
+		newformat = 1;
+	cnt = 0;
+
+	while (fgets(buf, sizeof(buf), fp)) {
+		struct sockstat *u, **insp;
+		int flags;
+
+		if (!(u = calloc(1, sizeof(*u))))
+			break;
+
+		if (sscanf(buf, "%lx: %x %x %x %x %x %d %s",
+			   (unsigned long *)&u->rport, &u->rq, &u->wq, &flags, &u->type,
+			   &u->state, &u->ino, name) < 8)
+			name[0] = 0;
+
+		u->lport = u->ino;
+		u->local.family = u->remote.family = AF_UNIX;
+
+		if (flags & (1 << 16)) {
+			u->state = SS_LISTEN;
+		} else if (u->state > 0 &&
+			   u->state <= ARRAY_SIZE(unix_state_map)) {
+			u->state = unix_state_map[u->state-1];
+			if (u->type == SOCK_DGRAM && u->state == SS_CLOSE && u->rport)
+				u->state = SS_ESTABLISHED;
+		}
+		if (unix_type_skip(u, f) ||
+		    !(f->states & (1 << u->state))) {
+			free(u);
+			continue;
+		}
+
+		if (!newformat) {
+			u->rport = 0;
+			u->rq = 0;
+			u->wq = 0;
+		}
+
+		if (name[0]) {
+			u->name = strdup(name);
+			if (!u->name) {
+				free(u);
+				break;
+			}
+		}
+
+		if (u->rport) {
+			struct sockstat *p;
+
+			for (p = list; p; p = p->next) {
+				if (u->rport == p->lport)
+					break;
+			}
+			if (!p)
+				u->peer_name = "?";
+			else
+				u->peer_name = p->name ? : "*";
+		}
+
+		if (f->f) {
+			struct sockstat st = {
+				.local.family = AF_UNIX,
+				.remote.family = AF_UNIX,
+			};
+
+			memcpy(st.local.data, &u->name, sizeof(u->name));
+			/* when parsing the old format rport is set to 0 and
+			 * therefore peer_name remains NULL
+			 */
+			if (u->peer_name && strcmp(u->peer_name, "*"))
+				memcpy(st.remote.data, &u->peer_name,
+				       sizeof(u->peer_name));
+			if (run_ssfilter(f->f, &st) == 0) {
+				free(u->name);
+				free(u);
+				continue;
+			}
+		}
+
+		insp = &list;
+		while (*insp) {
+			if (u->type < (*insp)->type ||
+			    (u->type == (*insp)->type &&
+			     u->ino < (*insp)->ino))
+				break;
+			insp = &(*insp)->next;
+		}
+		u->next = *insp;
+		*insp = u;
+
+		if (++cnt > MAX_UNIX_REMEMBER) {
+			while (list) {
+				unix_stats_print(list, f);
+				unix_list_drop_first(&list);
+			}
+			cnt = 0;
+		}
+	}
+	fclose(fp);
+	while (list) {
+		unix_stats_print(list, f);
+		unix_list_drop_first(&list);
+	}
+
 	return 0;
 }
 
@@ -4356,6 +4754,10 @@ static int packet_show_sock(struct nlmsghdr *nlh, void *arg)
 
 	parse_rtattr(tb, PACKET_DIAG_MAX, (struct rtattr *)(r+1),
 		     nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*r)));
+
+	/* use /proc/net/packet if all info are not available */
+	if (!tb[PACKET_DIAG_MEMINFO])
+		return -1;
 
 	stat.type   = r->pdiag_type;
 	stat.prot   = r->pdiag_num;
@@ -4492,14 +4894,56 @@ static int packet_show_netlink(struct filter *f)
 	return handle_netlink_request(f, &req.nlh, sizeof(req), packet_show_sock);
 }
 
+static int packet_show_line(char *buf, const struct filter *f, int fam)
+{
+	unsigned long long sk;
+	struct sockstat stat = {};
+	int type, prot, iface, state, rq, uid, ino;
+
+	sscanf(buf, "%llx %*d %d %x %d %d %u %u %u",
+			&sk,
+			&type, &prot, &iface, &state,
+			&rq, &uid, &ino);
+
+	if (type == SOCK_RAW && !(f->dbs & (1<<PACKET_R_DB)))
+		return 0;
+	if (type == SOCK_DGRAM && !(f->dbs & (1<<PACKET_DG_DB)))
+		return 0;
+
+	stat.type  = type;
+	stat.prot  = prot;
+	stat.lport = stat.iface = iface;
+	stat.state = state;
+	stat.rq    = rq;
+	stat.uid   = uid;
+	stat.ino   = ino;
+	stat.state = SS_CLOSE;
+
+	if (packet_stats_print(&stat, f))
+		return 0;
+
+	return 0;
+}
+
 static int packet_show(struct filter *f)
 {
+	FILE *fp;
+	int rc = 0;
+
 	if (!filter_af_get(f, AF_PACKET) || !(f->states & (1 << SS_CLOSE)))
 		return 0;
 
-	if (packet_show_netlink(f))
-		return sock_diag_error("PACKET");
-	return 0;
+	if (!getenv("PROC_NET_PACKET") && !getenv("PROC_ROOT") &&
+			packet_show_netlink(f) == 0)
+		return 0;
+
+	if ((fp = net_packet_open()) == NULL)
+		return -1;
+	if (generic_record_read(fp, packet_show_line, f, AF_PACKET))
+		rc = -1;
+
+	fclose(fp);
+	return rc;
 }
 
 static int xdp_stats_print(struct sockstat *s, const struct filter *f)
@@ -4664,47 +5108,10 @@ static int xdp_show(struct filter *f)
 	return handle_netlink_request(f, &req.nlh, sizeof(req), xdp_show_sock);
 }
 
-/* A netlink port id is chosen by whoever binds the socket; it is the
- * pid of the owner only by convention. Check that the process holds it.
- */
-static bool netlink_pid_holds_sock(int pid, unsigned int ino)
-{
-	char path[MAX_PATH_LEN];
-	struct dirent *d;
-	bool ret = false;
-	DIR *dir;
-
-	if (pid <= 0 || !ino)
-		return false;
-
-	snprintf(path, sizeof(path), "%s/%d/fd",
-		 getenv("PROC_ROOT") ? : "/proc", pid);
-	dir = opendir(path);
-	if (!dir)
-		return false;
-
-	while (!ret && (d = readdir(dir)) != NULL) {
-		unsigned int fd_ino;
-		ssize_t link_len;
-		char lnk[64];
-
-		link_len = readlinkat(dirfd(dir), d->d_name, lnk, sizeof(lnk) - 1);
-		if (link_len == -1)
-			continue;
-		lnk[link_len] = '\0';
-
-		if (sscanf(lnk, "socket:[%u]", &fd_ino) == 1)
-			ret = fd_ino == ino;
-	}
-	closedir(dir);
-
-	return ret;
-}
-
 static int netlink_show_one(struct filter *f,
 				int prot, int pid, unsigned int groups,
 				int state, int dst_pid, unsigned int dst_group,
-				int rq, int wq, unsigned int ino,
+				int rq, int wq,
 				unsigned long long sk, unsigned long long cb)
 {
 	struct sockstat st = {
@@ -4718,7 +5125,6 @@ static int netlink_show_one(struct filter *f,
 	SPRINT_BUF(prot_buf) = {};
 	const char *prot_name;
 	char procname[64] = {};
-	bool is_owner = false;
 
 	if (f->f) {
 		st.rport = -1;
@@ -4732,26 +5138,27 @@ static int netlink_show_one(struct filter *f,
 
 	prot_name = nl_proto_n2a(prot, prot_buf, sizeof(prot_buf));
 
-	if (pid > 0 && (!numeric || show_proc_ctx))
-		is_owner = netlink_pid_holds_sock(pid, ino);
-
 	if (pid == -1) {
 		procname[0] = '*';
 	} else if (!numeric) {
-		char task[16];
 		int done = 0;
 
 		if (!pid) {
 			done = 1;
 			strncpy(procname, "kernel", 7);
-		} else if (is_owner) {
-			if (get_task_name(getenv("PROC_ROOT"), pid,
-					  task, sizeof(task)) == 0) {
-				escape_str(procname, task, sizeof(procname));
-				snprintf(procname + strlen(procname),
-					 sizeof(procname) - strlen(procname),
-					 "/%d", pid);
-				done = 1;
+		} else if (pid > 0) {
+			FILE *fp;
+
+			snprintf(procname, sizeof(procname), "%s/%d/stat",
+				getenv("PROC_ROOT") ? : "/proc", pid);
+			if ((fp = fopen(procname, "r")) != NULL) {
+				if (fscanf(fp, "%*d (%[^)])", procname) == 1) {
+					snprintf(procname+strlen(procname),
+						sizeof(procname)-strlen(procname),
+						"/%d", pid);
+					done = 1;
+				}
+				fclose(fp);
 			}
 		}
 		if (!done)
@@ -4777,13 +5184,13 @@ static int netlink_show_one(struct filter *f,
 	if (show_proc_ctx) {
 		/* The pid value will either be:
 		 *   0 if destination kernel - show kernel initial context.
-		 *   The pid of a process holding the socket - use getpidcon.
+		 *   A valid process pid - use getpidcon.
 		 *   A unique value allocated by the kernel or netlink user
 		 *   to the process - show context as "not available".
 		 */
 		if (!pid)
 			security_get_initial_context("kernel", &pid_context);
-		else if (is_owner)
+		else if (pid > 0)
 			getpidcon(pid, &pid_context);
 
 		out(" proc_ctx=%s", pid_context ? : "unavailable");
@@ -4822,7 +5229,7 @@ static int netlink_show_sock(struct nlmsghdr *nlh, void *arg)
 
 	if (netlink_show_one(f, r->ndiag_protocol, r->ndiag_portid, groups,
 			 r->ndiag_state, r->ndiag_dst_portid, r->ndiag_dst_group,
-			 rq, wq, r->ndiag_ino, 0, 0)) {
+			 rq, wq, 0, 0)) {
 		return 0;
 	}
 
@@ -4847,11 +5254,36 @@ static int netlink_show_netlink(struct filter *f)
 
 static int netlink_show(struct filter *f)
 {
+	FILE *fp;
+	char buf[256];
+	int prot, pid;
+	unsigned int groups;
+	int rq, wq, rc;
+	unsigned long long sk, cb;
+
 	if (!filter_af_get(f, AF_NETLINK) || !(f->states & (1 << SS_CLOSE)))
 		return 0;
 
-	if (netlink_show_netlink(f))
-		return sock_diag_error("NETLINK");
+	if (!getenv("PROC_NET_NETLINK") && !getenv("PROC_ROOT") &&
+		netlink_show_netlink(f) == 0)
+		return 0;
+
+	if ((fp = net_netlink_open()) == NULL)
+		return -1;
+	if (!fgets(buf, sizeof(buf), fp)) {
+		fclose(fp);
+		return -1;
+	}
+
+	while (fgets(buf, sizeof(buf), fp)) {
+		sscanf(buf, "%llx %d %d %x %d %d %llx %d",
+		       &sk,
+		       &prot, &pid, &groups, &rq, &wq, &cb, &rc);
+
+		netlink_show_one(f, prot, pid, groups, 0, 0, 0, rq, wq, sk, cb);
+	}
+
+	fclose(fp);
 	return 0;
 }
 
@@ -5003,9 +5435,9 @@ static int tipc_show_sock(struct nlmsghdr *nlh, void *arg)
 
 	if (show_tipcinfo) {
 		if (oneline)
-			out(" type:%s", TABLE_NAME(stype_nameg, ss.type));
+			out(" type:%s", stype_nameg[ss.type]);
 		else
-			out("\n type:%s", TABLE_NAME(stype_nameg, ss.type));
+			out("\n type:%s", stype_nameg[ss.type]);
 		out(" cong:%s ",
 		       stat[TIPC_NLA_SOCK_STAT_LINK_CONG] ? "link" :
 		       stat[TIPC_NLA_SOCK_STAT_CONN_CONG] ? "conn" : "none");
@@ -5101,19 +5533,14 @@ static int handle_follow_request(struct filter *f)
 	rth.local.nl_pid = 0;
 
 	if (f->kill) {
-		/* Only used to send SOCK_DESTROY, must not get the events */
-		if (rtnl_open_byproto(&rth2, 0, NETLINK_SOCK_DIAG)) {
+		if (rtnl_open_byproto(&rth2, groups, NETLINK_SOCK_DIAG)) {
 			rtnl_close(&rth);
 			return -1;
 		}
 		f->rth_for_killing = &rth2;
 	}
 
-	/* ENOBUFS means events were lost, keep listening */
-	do {
-		ret = rtnl_dump_filter(&rth, generic_show_sock, f);
-	} while (ret == -ENOBUFS);
-	if (ret)
+	if (rtnl_dump_filter(&rth, generic_show_sock, f))
 		ret = -1;
 
 	rtnl_close(&rth);
@@ -5296,10 +5723,8 @@ static void _usage(FILE *dest)
 "       --tos           show tos and priority information\n"
 "       --cgroup        show cgroup information\n"
 "   -b, --bpf           show bpf filter socket information\n"
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 "       --bpf-maps      show all BPF socket-local storage maps\n"
 "       --bpf-map-id=MAP-ID    show a BPF socket-local storage map\n"
-#endif
 "   -E, --events        continually display sockets as they are destroyed\n"
 "   -Z, --context       display task SELinux security contexts\n"
 "   -z, --contexts      display task and socket SELinux security contexts\n"
@@ -5473,10 +5898,8 @@ static const struct option long_opts[] = {
 	{ "mptcp", 0, 0, 'M' },
 	{ "oneline", 0, 0, 'O' },
 	{ "inet-sockopt", 0, 0, OPT_INET_SOCKOPT },
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 	{ "bpf-maps", 0, 0, OPT_BPF_MAPS},
 	{ "bpf-map-id", 1, 0, OPT_BPF_MAP_ID},
-#endif
 	{ 0 }
 
 };
@@ -5490,9 +5913,6 @@ int main(int argc, char *argv[])
 	FILE *filter_fp = NULL;
 	int ch;
 	int state_filter = 0;
-
-	/* needed by escape_str() to pass through UTF-8 names */
-	setlocale(LC_CTYPE, "");
 
 	while ((ch = getopt_long(argc, argv,
 				 "halBetuwxnro460spTbEf:mMiA:D:F:vVzZN:KHQSO",
@@ -5685,7 +6105,6 @@ int main(int argc, char *argv[])
 		case OPT_INET_SOCKOPT:
 			show_inet_sockopt = 1;
 			break;
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 		case OPT_BPF_MAPS:
 			if (bpf_map_opts.nr_maps) {
 				bpf_map_opts_mixed_error();
@@ -5697,7 +6116,6 @@ int main(int argc, char *argv[])
 			if (bpf_map_opts_add_id(optarg))
 				exit(1);
 			break;
-#endif
 		case 'h':
 			help();
 		case '?':
@@ -5835,9 +6253,7 @@ int main(int argc, char *argv[])
 	if (show_processes || show_threads || show_proc_ctx || show_sock_ctx)
 		user_ent_destroy();
 
-#ifdef ENABLE_BPF_SKSTORAGE_SUPPORT
 	bpf_map_opts_destroy();
-#endif
 
 	render();
 

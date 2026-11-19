@@ -5,14 +5,8 @@ CFLAGS += -fPIC
 
 UTILOBJ = utils.o utils_math.o rt_names.o ll_map.o ll_types.o ll_proto.o ll_addr.o \
 	inet_proto.o namespace.o json_writer.o json_print.o json_print_math.o \
-	names.o color.o bpf_legacy.o bpf_glue.o exec.o fs.o cg_map.o \
-	ppp_proto.o bridge.o sha1.o escape.o
-
-ifeq ($(HAVE_ELF),y)
-ifeq ($(HAVE_LIBBPF),y)
-UTILOBJ += bpf_libbpf.o
-endif
-endif
+	names.o color.o bpf_util.o bpf_glue.o bpf_libbpf.o exec.o fs.o \
+	cg_map.o ppp_proto.o bridge.o escape.o
 
 ifneq ($(HAVE_SELINUX),y)
 UTILOBJ += selinux.o
