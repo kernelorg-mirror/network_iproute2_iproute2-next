@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <mntent.h>
 
 #include <arpa/inet.h>
 
@@ -543,12 +544,13 @@ static const char *bpf_find_mntpt_single(unsigned long magic, char *mnt,
 	int ret;
 
 	ret = bpf_valid_mntpt(mntpt, magic);
-	if (!ret) {
-		strlcpy(mnt, mntpt, len);
-		return mnt;
-	}
+	if (ret)
+		return NULL;
 
-	return NULL;
+	if (strlcpy(mnt, mntpt, len) >= (size_t)len)
+		return NULL;
+
+	return mnt;
 }
 
 static const char *bpf_find_mntpt(const char *fstype, unsigned long magic,
@@ -556,7 +558,8 @@ static const char *bpf_find_mntpt(const char *fstype, unsigned long magic,
 				  const char * const *known_mnts)
 {
 	const char * const *ptr;
-	char type[100];
+	const char *found = NULL;
+	struct mntent *ent;
 	FILE *fp;
 
 	if (known_mnts) {
@@ -568,24 +571,21 @@ static const char *bpf_find_mntpt(const char *fstype, unsigned long magic,
 		}
 	}
 
-	if (len != PATH_MAX)
-		return NULL;
-
-	fp = fopen("/proc/mounts", "r");
+	fp = setmntent("/proc/mounts", "r");
 	if (fp == NULL)
 		return NULL;
 
-	while (fscanf(fp, "%*s %" textify(PATH_MAX) "s %99s %*s %*d %*d\n",
-		      mnt, type) == 2) {
-		if (strcmp(type, fstype) == 0)
+	while ((ent = getmntent(fp)) != NULL) {
+		if (strcmp(ent->mnt_type, fstype) != 0)
+			continue;
+
+		found = bpf_find_mntpt_single(magic, mnt, len, ent->mnt_dir);
+		if (found)
 			break;
 	}
 
-	fclose(fp);
-	if (strcmp(type, fstype) != 0)
-		return NULL;
-
-	return mnt;
+	endmntent(fp);
+	return found;
 }
 
 int bpf_trace_pipe(void)
