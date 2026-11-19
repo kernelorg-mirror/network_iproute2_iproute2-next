@@ -712,7 +712,7 @@ static int bpf_gen_hierarchy(const char *base)
 
 static const char *bpf_get_work_dir(enum bpf_prog_type type)
 {
-	static char bpf_tmp[PATH_MAX] = BPF_DIR_MNT;
+	static char bpf_tmp[PATH_MAX+1] = BPF_DIR_MNT;
 	static char bpf_wrk_dir[PATH_MAX];
 	static const char *mnt;
 	static bool bpf_mnt_cached;
@@ -767,6 +767,11 @@ static const char *bpf_get_work_dir(enum bpf_prog_type type)
 	mnt = bpf_wrk_dir;
 out:
 	bpf_mnt_cached = true;
+	if (mnt && type) {
+		snprintf(bpf_tmp, sizeof(bpf_tmp), "%s%s/",
+			 mnt, bpf_prog_to_subdir(type));
+		return bpf_tmp;
+	}
 	return mnt;
 }
 
@@ -1068,20 +1073,27 @@ static void bpf_init_env(void)
 
 	/* Don't bother in case we fail! */
 	setrlimit(RLIMIT_MEMLOCK, &limit);
-
-	if (!bpf_get_work_dir(BPF_PROG_TYPE_UNSPEC))
-		fprintf(stderr, "Continuing without mounted eBPF fs. Too old kernel?\n");
 }
 
 int iproute2_get_root_path(enum bpf_prog_type type, char *root_path,
 			   size_t len)
 {
+	const char *wrk_dir;
 	int ret;
 
 	bpf_init_env();
 
-	snprintf(root_path, len, "%s/%s",
-		 bpf_get_work_dir(type), BPF_DIR_GLOBALS);
+	wrk_dir = bpf_get_work_dir(type);
+	if (!wrk_dir) {
+		fprintf(stderr, "No mounted eBPF fs to pin maps under\n");
+		return -1;
+	}
+
+	if ((size_t)snprintf(root_path, len, "%s/%s",
+			     wrk_dir, BPF_DIR_GLOBALS) >= len) {
+		fprintf(stderr, "Pin root path for %s too long\n", wrk_dir);
+		return -1;
+	}
 
 	ret = mkdir(root_path, S_IRWXU);
 	if (ret && errno != EEXIST) {
