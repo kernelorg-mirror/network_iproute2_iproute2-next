@@ -10,8 +10,6 @@ queueing disciplines
 OBJ_FILE ] [
 .B section
 CLS_NAME ] [
-.B export
-UDS_FILE ] [
 .B verbose
 ] [
 .B direct-action
@@ -35,8 +33,6 @@ CLASSID ]
 OBJ_FILE ] [
 .B section
 CLS_NAME ] [
-.B export
-UDS_FILE ] [
 .B verbose
 ]
 
@@ -157,17 +153,6 @@ classifier is called "classifier", and for the action "action". Given
 that a single object file can contain multiple classifier and actions,
 the corresponding section name needs to be specified, if it differs
 from the defaults.
-
-.SS export
-points to a Unix domain socket file. In case the eBPF object file also
-contains a section named "maps" with eBPF map specifications, then the
-map file descriptors can be handed off via the Unix domain socket to
-an eBPF "agent" herding all descriptors after tc lifetime. This can be
-some third party application implementing the IPC counterpart for the
-import, that uses them for calling into
-.B bpf(2)
-system call to read out or update eBPF map data from user space, for
-example, for monitoring purposes or to push down new policies.
 
 .SS verbose
 if set, it will dump the eBPF verifier output, even if loading the eBPF
@@ -424,90 +409,20 @@ example:
 The advantage of this is that the classifier and the two actions can
 then share eBPF maps with each other, if implemented in the programs.
 
-In order to access eBPF maps from user space beyond
+eBPF maps can be accessed from user space beyond
 .B tc(8)
-setup lifetime, the ownership can be transferred to an eBPF agent via
-Unix domain sockets. There are two possibilities for implementing this:
-
-.B 1)
-implementation of an own eBPF agent that takes care of setting up
-the Unix domain socket and implementing the protocol that
-.B tc(8)
-dictates. A code example of this can be found inside the iproute2
-source package under:
-.B examples/bpf/
-
-.B 2)
-use
-.B tc exec
-for transferring the eBPF map file descriptors through a Unix domain
-socket, and spawning an application such as
-.B sh(1)
-\&. This approach's advantage is that tc will place the file descriptors
-into the environment and thus make them available just like stdin, stdout,
-stderr file descriptors, meaning, in case user applications run from within
-this fd-owner shell, they can terminate and restart without losing eBPF
-maps file descriptors. Example invocation with the previous classifier and
-action mixture:
-
-.in +4n
-.B tc exec bpf imp /tmp/bpf
-.br
-.B tc filter add dev em1 parent 1: bpf obj bpf.o exp /tmp/bpf flowid 1:1 \e
-.br
-.in +25n
-.B                          action bpf obj bpf.o sec action-mark \e
-.br
-.B                          action bpf obj bpf.o sec action-rand ok
-.in -25n
-.in -4n
-
-Assuming that eBPF maps are shared with classifier and actions, it's
-enough to export them once, for example, from within the classifier
-or action command. tc will setup all eBPF map file descriptors at the
-time when the object file is first parsed.
-
-When a shell has been spawned, the environment will have a couple of
-eBPF related variables. BPF_NUM_MAPS provides the total number of maps
-that have been transferred over the Unix domain socket. BPF_MAP<X>'s
-value is the file descriptor number that can be accessed in eBPF agent
-applications, in other words, it can directly be used as the file
-descriptor value for the
+setup lifetime by pinning them in the BPF file system. Maps declared
+with the
+.B pinning
+attribute set to
+.B LIBBPF_PIN_BY_NAME
+are pinned under
+.B /sys/fs/bpf/tc/globals/
+and can be inspected or updated with
+.B bpftool(8)
+or any program using the
 .B bpf(2)
-system call to retrieve or alter eBPF map values. <X> denotes the
-identifier of the eBPF map. It corresponds to the
-.B id
-member of
-.B struct bpf_elf_map
-\& from the tc eBPF map specification.
-
-The environment in this example looks as follows:
-
-.in +4n
-.nf
-.sp
-sh# env | grep BPF
-    BPF_NUM_MAPS=3
-    BPF_MAP1=6
-    BPF_MAP0=5
-    BPF_MAP2=7
-sh# ls -la /proc/self/fd
-    [...]
-    lrwx------. 1 root root 64 Apr 14 16:46 5 -> anon_inode:bpf-map
-    lrwx------. 1 root root 64 Apr 14 16:46 6 -> anon_inode:bpf-map
-    lrwx------. 1 root root 64 Apr 14 16:46 7 -> anon_inode:bpf-map
-sh# my_bpf_agent
-.fi
-.in
-
-eBPF agents are very useful in that they can prepopulate eBPF maps from
-user space, monitor statistics via maps and based on that feedback, for
-example, rewrite classids in eBPF map values during runtime. Given that eBPF
-agents are implemented as normal applications, they can also dynamically
-receive traffic control policies from external controllers and thus push
-them down into eBPF maps to dynamically adapt to network conditions. Moreover,
-eBPF maps can also be shared with other eBPF program types (e.g. tracing),
-thus very powerful combination can therefore be implemented.
+system call.
 
 .SS eBPF PROGRAMMING
 

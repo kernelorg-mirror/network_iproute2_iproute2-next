@@ -16,9 +16,8 @@
 #include <linux/elf-em.h>
 
 #include "utils.h"
-#include "bpf_scm.h"
+#include "bpf_elf.h"
 
-#define BPF_ENV_UDS	"TC_BPF_UDS"
 #define BPF_ENV_MNT	"TC_BPF_MNT"
 
 #ifndef BPF_MAX_LOG
@@ -60,7 +59,6 @@ struct bpf_cfg_in {
 	const char *object;
 	const char *section;
 	const char *prog_name;
-	const char *uds;
 	enum bpf_prog_type type;
 	enum bpf_mode mode;
 	__u32 ifindex;
@@ -282,9 +280,6 @@ int bpf_dump_prog_info(FILE *f, uint32_t id);
 int bpf(int cmd, union bpf_attr *attr, unsigned int size);
 
 #ifdef HAVE_ELF
-int bpf_send_map_fds(const char *path, const char *obj);
-int bpf_recv_map_fds(const char *path, int *fds, struct bpf_map_aux *aux,
-		     unsigned int entries);
 #ifdef HAVE_LIBBPF
 int iproute2_bpf_elf_ctx_init(struct bpf_cfg_in *cfg);
 int iproute2_bpf_fetch_ancillary(void);
@@ -296,17 +291,6 @@ int iproute2_find_map_name_by_id(unsigned int map_id, char *name);
 int iproute2_load_libbpf(struct bpf_cfg_in *cfg);
 #endif /* HAVE_LIBBPF */
 #else
-static inline int bpf_send_map_fds(const char *path, const char *obj)
-{
-	return 0;
-}
-
-static inline int bpf_recv_map_fds(const char *path, int *fds,
-				   struct bpf_map_aux *aux,
-				   unsigned int entries)
-{
-	return -1;
-}
 #ifdef HAVE_LIBBPF
 static inline int iproute2_load_libbpf(struct bpf_cfg_in *cfg)
 {

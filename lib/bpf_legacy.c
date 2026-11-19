@@ -42,13 +42,11 @@
 
 #include "bpf_util.h"
 #include "bpf_elf.h"
-#include "bpf_scm.h"
 
 struct bpf_prog_meta {
 	const char *type;
 	const char *subdir;
 	const char *section;
-	bool may_uds_export;
 };
 
 static const enum bpf_prog_type __bpf_types[] = {
@@ -65,13 +63,11 @@ static const struct bpf_prog_meta __bpf_prog_meta[] = {
 		.type		= "cls",
 		.subdir		= "tc",
 		.section	= ELF_SECTION_CLASSIFIER,
-		.may_uds_export	= true,
 	},
 	[BPF_PROG_TYPE_SCHED_ACT] = {
 		.type		= "act",
 		.subdir		= "tc",
 		.section	= ELF_SECTION_ACTION,
-		.may_uds_export	= true,
 	},
 	[BPF_PROG_TYPE_XDP] = {
 		.type		= "xdp",
@@ -827,7 +823,7 @@ static int bpf_obj_pinned(const char *pathname, enum bpf_prog_type type)
 
 static int bpf_do_parse(struct bpf_cfg_in *cfg, const bool *opt_tbl)
 {
-	const char *file, *section, *uds_name, *prog_name;
+	const char *file, *section, *prog_name;
 	bool verbose = false;
 	int i, ret, argc;
 	char **argv;
@@ -858,7 +854,7 @@ static int bpf_do_parse(struct bpf_cfg_in *cfg, const bool *opt_tbl)
 	}
 
 	NEXT_ARG();
-	file = section = uds_name = prog_name = NULL;
+	file = section = prog_name = NULL;
 	if (cfg->mode == EBPF_OBJECT || cfg->mode == EBPF_PINNED) {
 		file = *argv;
 		NEXT_ARG_FWD();
@@ -901,16 +897,6 @@ static int bpf_do_parse(struct bpf_cfg_in *cfg, const bool *opt_tbl)
 			NEXT_ARG_FWD();
 		}
 
-		if (__bpf_prog_meta[cfg->type].may_uds_export) {
-			uds_name = getenv(BPF_ENV_UDS);
-			if (argc > 0 && !uds_name &&
-			    matches(*argv, "export") == 0) {
-				NEXT_ARG();
-				uds_name = *argv;
-				NEXT_ARG_FWD();
-			}
-		}
-
 		if (argc > 0 && matches(*argv, "verbose") == 0) {
 			verbose = true;
 			NEXT_ARG_FWD();
@@ -934,7 +920,6 @@ static int bpf_do_parse(struct bpf_cfg_in *cfg, const bool *opt_tbl)
 
 	cfg->object  = file;
 	cfg->section = section;
-	cfg->uds     = uds_name;
 	cfg->argc    = argc;
 	cfg->argv    = argv;
 	cfg->verbose = verbose;
@@ -1179,7 +1164,6 @@ struct bpf_elf_ctx {
 	enum bpf_prog_type	type;
 	__u32			ifindex;
 	bool			verbose;
-	struct bpf_elf_st	stat;
 	struct bpf_hash_entry	*ht[256];
 	char			*log;
 	size_t			log_size;
@@ -1189,13 +1173,6 @@ struct bpf_elf_sec_data {
 	GElf_Shdr		sec_hdr;
 	Elf_Data		*sec_data;
 	const char		*sec_name;
-};
-
-struct bpf_map_data {
-	int			*fds;
-	const char		*obj;
-	struct bpf_elf_st	*st;
-	struct bpf_elf_map	*ent;
 };
 
 static bool bpf_log_has_data(struct bpf_elf_ctx *ctx)
@@ -2647,24 +2624,6 @@ static int bpf_fill_prog_arrays(struct bpf_elf_ctx *ctx)
 	return 0;
 }
 
-static void bpf_save_finfo(struct bpf_elf_ctx *ctx)
-{
-	struct stat st;
-	int ret;
-
-	memset(&ctx->stat, 0, sizeof(ctx->stat));
-
-	ret = fstat(ctx->obj_fd, &st);
-	if (ret < 0) {
-		fprintf(stderr, "Stat of elf file failed: %s\n",
-			strerror(errno));
-		return;
-	}
-
-	ctx->stat.st_dev = st.st_dev;
-	ctx->stat.st_ino = st.st_ino;
-}
-
 static int bpf_read_pin_mapping(FILE *fp, uint32_t *id, char *path)
 {
 	char buff[PATH_MAX];
@@ -2877,7 +2836,6 @@ static int bpf_elf_ctx_init(struct bpf_elf_ctx *ctx, const char *pathname,
 		goto out_free;
 	}
 
-	bpf_save_finfo(ctx);
 	bpf_hash_init(ctx, CONF_ETC_DIR "/bpf_pinning");
 	if (ret == -ENOENT)
 		ret = bpf_hash_init(ctx, CONF_USR_DIR "/bpf_pinning");
@@ -2890,19 +2848,6 @@ out_elf:
 out_fd:
 	close(ctx->obj_fd);
 	return ret;
-}
-
-static int bpf_maps_count(struct bpf_elf_ctx *ctx)
-{
-	int i, count = 0;
-
-	for (i = 0; i < ARRAY_SIZE(ctx->map_fds); i++) {
-		if (!ctx->map_fds[i])
-			break;
-		count++;
-	}
-
-	return count;
 }
 
 static void bpf_maps_teardown(struct bpf_elf_ctx *ctx)
@@ -2973,164 +2918,6 @@ out:
 	}
 
 	return fd;
-}
-
-static int
-bpf_map_set_send(int fd, struct sockaddr_un *addr, unsigned int addr_len,
-		 const struct bpf_map_data *aux, unsigned int entries)
-{
-	struct bpf_map_set_msg msg = {
-		.aux.uds_ver = BPF_SCM_AUX_VER,
-		.aux.num_ent = entries,
-	};
-	int *cmsg_buf, min_fd;
-	char *amsg_buf;
-	int i;
-
-	strlcpy(msg.aux.obj_name, aux->obj, sizeof(msg.aux.obj_name));
-	memcpy(&msg.aux.obj_st, aux->st, sizeof(msg.aux.obj_st));
-
-	cmsg_buf = bpf_map_set_init(&msg, addr, addr_len);
-	amsg_buf = (char *)msg.aux.ent;
-
-	for (i = 0; i < entries; i += min_fd) {
-		int ret;
-
-		min_fd = min(BPF_SCM_MAX_FDS * 1U, entries - i);
-		bpf_map_set_init_single(&msg, min_fd);
-
-		memcpy(cmsg_buf, &aux->fds[i], sizeof(aux->fds[0]) * min_fd);
-		memcpy(amsg_buf, &aux->ent[i], sizeof(aux->ent[0]) * min_fd);
-
-		ret = sendmsg(fd, &msg.hdr, 0);
-		if (ret <= 0)
-			return ret ? : -1;
-	}
-
-	return 0;
-}
-
-static int
-bpf_map_set_recv(int fd, int *fds,  struct bpf_map_aux *aux,
-		 unsigned int entries)
-{
-	struct bpf_map_set_msg msg;
-	int *cmsg_buf, min_fd;
-	char *amsg_buf, *mmsg_buf;
-	unsigned int needed = 1;
-	int i;
-
-	cmsg_buf = bpf_map_set_init(&msg, NULL, 0);
-	amsg_buf = (char *)msg.aux.ent;
-	mmsg_buf = (char *)&msg.aux;
-
-	for (i = 0; i < min(entries, needed); i += min_fd) {
-		struct cmsghdr *cmsg;
-		int ret;
-
-		min_fd = min(entries, entries - i);
-		bpf_map_set_init_single(&msg, min_fd);
-
-		ret = recvmsg(fd, &msg.hdr, 0);
-		if (ret <= 0)
-			return ret ? : -1;
-
-		cmsg = CMSG_FIRSTHDR(&msg.hdr);
-		if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS)
-			return -EINVAL;
-		if (msg.hdr.msg_flags & MSG_CTRUNC)
-			return -EIO;
-		if (msg.aux.uds_ver != BPF_SCM_AUX_VER)
-			return -ENOSYS;
-
-		min_fd = (cmsg->cmsg_len - sizeof(*cmsg)) / sizeof(fd);
-		if (min_fd > entries || min_fd <= 0)
-			return -EINVAL;
-
-		memcpy(&fds[i], cmsg_buf, sizeof(fds[0]) * min_fd);
-		memcpy(&aux->ent[i], amsg_buf, sizeof(aux->ent[0]) * min_fd);
-		memcpy(aux, mmsg_buf, offsetof(struct bpf_map_aux, ent));
-
-		needed = aux->num_ent;
-	}
-
-	return 0;
-}
-
-int bpf_send_map_fds(const char *path, const char *obj)
-{
-	struct bpf_elf_ctx *ctx = &__ctx;
-	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	struct bpf_map_data bpf_aux = {
-		.fds = ctx->map_fds,
-		.ent = ctx->maps,
-		.st  = &ctx->stat,
-		.obj = obj,
-	};
-	int fd, ret = -1;
-
-	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		fprintf(stderr, "Cannot open socket: %s\n",
-			strerror(errno));
-		goto out;
-	}
-
-	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-
-	ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-	if (ret < 0) {
-		fprintf(stderr, "Cannot connect to %s: %s\n",
-			path, strerror(errno));
-		goto out;
-	}
-
-	ret = bpf_map_set_send(fd, &addr, sizeof(addr), &bpf_aux,
-			       bpf_maps_count(ctx));
-	if (ret < 0)
-		fprintf(stderr, "Cannot send fds to %s: %s\n",
-			path, strerror(errno));
-
-	bpf_maps_teardown(ctx);
-out:
-	if (fd >= 0)
-		close(fd);
-	return ret;
-}
-
-int bpf_recv_map_fds(const char *path, int *fds, struct bpf_map_aux *aux,
-		     unsigned int entries)
-{
-	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	int fd, ret = -1;
-
-	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		fprintf(stderr, "Cannot open socket: %s\n",
-			strerror(errno));
-		goto out;
-	}
-
-	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-
-	ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-	if (ret < 0) {
-		fprintf(stderr, "Cannot bind to socket: %s\n",
-			strerror(errno));
-		goto out;
-	}
-
-	ret = bpf_map_set_recv(fd, fds, aux, entries);
-	if (ret < 0)
-		fprintf(stderr, "Cannot recv fds from %s: %s\n",
-			path, strerror(errno));
-
-	unlink(addr.sun_path);
-
-out:
-	if (fd >= 0)
-		close(fd);
-	return ret;
 }
 
 #ifdef HAVE_LIBBPF

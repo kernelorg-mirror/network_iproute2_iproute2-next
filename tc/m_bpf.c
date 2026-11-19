@@ -29,7 +29,7 @@ static void explain(void)
 		" bytecode-file FILE\n"
 		"\n"
 		"eBPF use case:\n"
-		" object-file FILE [ section ACT_NAME ] [ export UDS_FILE ]"
+		" object-file FILE [ section ACT_NAME ]"
 		" [ verbose ]\n"
 		" object-pinned FILE\n"
 		"\n"
@@ -72,12 +72,11 @@ static const struct bpf_cfg_ops bpf_cb_ops = {
 static int bpf_parse_opt(const struct action_util *a, int *ptr_argc, char ***ptr_argv,
 			 int tca_id, struct nlmsghdr *n)
 {
-	const char *bpf_obj = NULL, *bpf_uds_name = NULL;
 	struct tc_act_bpf parm = {};
 	struct bpf_cfg_in cfg = {};
 	bool seen_run = false;
 	struct rtattr *tail;
-	int argc, ret = 0;
+	int argc;
 	char **argv;
 
 	argv = *ptr_argv;
@@ -107,9 +106,6 @@ opt_bpf:
 
 			argc = cfg.argc;
 			argv = cfg.argv;
-
-			bpf_obj = cfg.object;
-			bpf_uds_name = cfg.uds;
 		} else if (matches(*argv, "help") == 0) {
 			explain();
 			return -1;
@@ -142,13 +138,10 @@ opt_bpf:
 	addattr_l(n, MAX_MSG, TCA_ACT_BPF_PARMS, &parm, sizeof(parm));
 	addattr_nest_end(n, tail);
 
-	if (bpf_uds_name)
-		ret = bpf_send_map_fds(bpf_uds_name, bpf_obj);
-
 	*ptr_argc = argc;
 	*ptr_argv = argv;
 
-	return ret;
+	return 0;
 }
 
 static int bpf_print_opt(const struct action_util *au, FILE *f, struct rtattr *arg)
