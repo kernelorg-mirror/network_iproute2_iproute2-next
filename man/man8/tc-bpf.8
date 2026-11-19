@@ -235,8 +235,9 @@ rather resides in a text file.
 
 .SH EXAMPLES
 .SS eBPF TOOLING
-A full blown example including eBPF agent code can be found inside the
-iproute2 source package under:
+Examples of map sharing through bpffs pinning and of altering classifier
+behaviour with tail calls can be found inside the iproute2 source package
+under:
 .B examples/bpf/
 
 As prerequisites, the kernel needs to have the eBPF system call namely
@@ -435,8 +436,8 @@ provides eBPF helper functions that can be called from an eBPF program.
 This man page will only provide two minimal, stand-alone examples, have a
 look at
 .B examples/bpf
-from the iproute2 source package for a fully fledged flow dissector
-example to better demonstrate some of the possibilities with eBPF.
+from the iproute2 source package for further examples demonstrating some
+of the possibilities with eBPF.
 
 Supported 32 bit classifier return codes from the C program and their meanings:
 .in +4n
@@ -503,7 +504,7 @@ struct tuple {
         long bytes;
 };
 
-#define BPF_MAP_ID_STATS        1 /* agent's map identifier */
+#define BPF_MAP_ID_STATS        1 /* map identifier */
 #define BPF_MAX_MARK            256
 
 struct bpf_elf_map __section("maps") map_stats = {
