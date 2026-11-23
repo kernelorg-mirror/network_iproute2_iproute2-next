@@ -27,7 +27,7 @@ static void explain(void)
 		" bytecode-file FILE\n"
 		"\n"
 		"eBPF use case:\n"
-		" object-file FILE [ section CLS_NAME ] [ export UDS_FILE ]"
+		" object-file FILE [ section CLS_NAME ]"
 		" [ verbose ] [ direct-action ] [ skip_hw | skip_sw ]\n"
 		" object-pinned FILE [ direct-action ] [ skip_hw | skip_sw ]\n"
 		"\n"
@@ -74,7 +74,6 @@ static const struct bpf_cfg_ops bpf_cb_ops = {
 static int bpf_parse_opt(const struct filter_util *qu, char *handle,
 			 int argc, char **argv, struct nlmsghdr *n)
 {
-	const char *bpf_obj = NULL, *bpf_uds_name = NULL;
 	struct tcmsg *t = NLMSG_DATA(n);
 	unsigned int bpf_gen_flags = 0;
 	unsigned int bpf_flags = 0;
@@ -82,7 +81,6 @@ static int bpf_parse_opt(const struct filter_util *qu, char *handle,
 	bool seen_run = false;
 	bool skip_sw = false;
 	struct rtattr *tail;
-	int ret = 0;
 
 	if (handle) {
 		if (get_u32(&t->tcm_handle, handle, 0)) {
@@ -117,9 +115,6 @@ opt_bpf:
 
 			argc = cfg.argc;
 			argv = cfg.argv;
-
-			bpf_obj = cfg.object;
-			bpf_uds_name = cfg.uds;
 		} else if (matches(*argv, "classid") == 0 ||
 			   matches(*argv, "flowid") == 0) {
 			unsigned int classid;
@@ -181,10 +176,7 @@ opt_bpf:
 
 	tail->rta_len = (((void *)n) + n->nlmsg_len) - (void *)tail;
 
-	if (bpf_uds_name)
-		ret = bpf_send_map_fds(bpf_uds_name, bpf_obj);
-
-	return ret;
+	return 0;
 }
 
 static int bpf_print_opt(const struct filter_util *qu, FILE *f,

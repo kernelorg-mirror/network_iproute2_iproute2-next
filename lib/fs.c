@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/mount.h>
+#include <sys/vfs.h>
+#include <mntent.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -17,6 +19,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <linux/magic.h>
 
 #include "utils.h"
 
@@ -50,30 +53,34 @@ static int open_by_handle_at(int mount_fd, struct file_handle *handle, int flags
 }
 #endif
 
-/* return mount path of first occurrence of given fstype */
-static char *find_fs_mount(const char *fs_to_find)
+/* return mount path of first mount of given fstype that passes statfs check */
+static char *find_fs_mount(const char *fs_to_find, unsigned long magic)
 {
-	char path[4096];
-	char fstype[128];    /* max length of any filesystem name */
+	struct mntent *ent;
+	struct statfs st;
 	char *mnt = NULL;
 	FILE *fp;
 
-	fp = fopen("/proc/mounts", "r");
+	fp = setmntent("/proc/mounts", "r");
 	if (!fp) {
 		fprintf(stderr,
 			"Failed to open mounts file: %s\n", strerror(errno));
 		return NULL;
 	}
 
-	while (fscanf(fp, "%*s %4095s %127s %*s %*d %*d\n",
-		      path, fstype) == 2) {
-		if (strcmp(fstype, fs_to_find) == 0) {
-			mnt = strdup(path);
-			break;
-		}
+	while ((ent = getmntent(fp)) != NULL) {
+		if (strcmp(ent->mnt_type, fs_to_find) != 0)
+			continue;
+
+		if (statfs(ent->mnt_dir, &st) < 0 ||
+		    (unsigned long)st.f_type != magic)
+			continue;
+
+		mnt = strdup(ent->mnt_dir);
+		break;
 	}
 
-	fclose(fp);
+	endmntent(fp);
 
 	return mnt;
 }
@@ -81,7 +88,7 @@ static char *find_fs_mount(const char *fs_to_find)
 /* caller needs to free string returned */
 char *find_cgroup2_mount(bool do_mount)
 {
-	char *mnt = find_fs_mount(CGROUP2_FS_NAME);
+	char *mnt = find_fs_mount(CGROUP2_FS_NAME, CGROUP2_SUPER_MAGIC);
 
 	if (mnt)
 		return mnt;

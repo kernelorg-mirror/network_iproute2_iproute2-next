@@ -23,7 +23,7 @@ struct {
 __section("egress")
 int emain(struct __sk_buff *skb)
 {
-	struct bpf_elf_map *map_inner;
+	void *map_inner;
 	int key = 0, *val;
 
 	map_inner = map_lookup_elem(&map_outer, &key);
@@ -39,7 +39,7 @@ int emain(struct __sk_buff *skb)
 __section("ingress")
 int imain(struct __sk_buff *skb)
 {
-	struct bpf_elf_map *map_inner;
+	void *map_inner;
 	int key = 0, *val;
 
 	map_inner = map_lookup_elem(&map_outer, &key);

@@ -10,8 +10,6 @@ queueing disciplines
 OBJ_FILE ] [
 .B section
 CLS_NAME ] [
-.B export
-UDS_FILE ] [
 .B verbose
 ] [
 .B direct-action
@@ -35,8 +33,6 @@ CLASSID ]
 OBJ_FILE ] [
 .B section
 CLS_NAME ] [
-.B export
-UDS_FILE ] [
 .B verbose
 ]
 
@@ -158,17 +154,6 @@ that a single object file can contain multiple classifier and actions,
 the corresponding section name needs to be specified, if it differs
 from the defaults.
 
-.SS export
-points to a Unix domain socket file. In case the eBPF object file also
-contains a section named "maps" with eBPF map specifications, then the
-map file descriptors can be handed off via the Unix domain socket to
-an eBPF "agent" herding all descriptors after tc lifetime. This can be
-some third party application implementing the IPC counterpart for the
-import, that uses them for calling into
-.B bpf(2)
-system call to read out or update eBPF map data from user space, for
-example, for monitoring purposes or to push down new policies.
-
 .SS verbose
 if set, it will dump the eBPF verifier output, even if loading the eBPF
 program was successful. By default, only on error, the verifier log is
@@ -250,8 +235,8 @@ rather resides in a text file.
 
 .SH EXAMPLES
 .SS eBPF TOOLING
-A full blown example including eBPF agent code can be found inside the
-iproute2 source package under:
+Example eBPF programs can be found inside the iproute2 source package
+under:
 .B examples/bpf/
 
 As prerequisites, the kernel needs to have the eBPF system call namely
@@ -270,23 +255,13 @@ support, depending which of the two the given architecture supports:
 A given restricted C file can be compiled via LLVM as:
 
 .in +4n
-.B clang -O2 -emit-llvm -c bpf.c -o - | llc -march=bpf -filetype=obj -o bpf.o
+.B clang -O2 -g -target bpf -c bpf.c -o bpf.o
 .in
 
-The compiler invocation might still simplify in future, so for now,
-it's quite handy to alias this construct in one way or another, for
-example:
-.in +4n
-.nf
-.sp
-__bcc() {
-        clang -O2 -emit-llvm -c $1 -o - | \\
-        llc -march=bpf -filetype=obj -o "`basename $1 .c`.o"
-}
-
-alias bcc=__bcc
-.fi
-.in
+The
+.B -g
+option is needed for programs that define maps, since the map
+definitions are described by BTF type information.
 
 A minimal, stand-alone unit, which matches on all traffic with the
 default classid (return code of -1) looks like:
@@ -339,7 +314,7 @@ objdump -h bpf.o
                 CONTENTS, ALLOC, LOAD, RELOC, READONLY, CODE
 5 action-rand   00000098  0000000000000000  0000000000000000  000008c0  2**3
                 CONTENTS, ALLOC, LOAD, RELOC, READONLY, CODE
-6 maps          00000030  0000000000000000  0000000000000000  00000958  2**2
+6 .maps         00000028  0000000000000000  0000000000000000  00000958  2**3
                 CONTENTS, ALLOC, LOAD, DATA
 7 license       00000004  0000000000000000  0000000000000000  00000988  2**0
                 CONTENTS, ALLOC, LOAD, DATA
@@ -424,90 +399,20 @@ example:
 The advantage of this is that the classifier and the two actions can
 then share eBPF maps with each other, if implemented in the programs.
 
-In order to access eBPF maps from user space beyond
+eBPF maps can be accessed from user space beyond
 .B tc(8)
-setup lifetime, the ownership can be transferred to an eBPF agent via
-Unix domain sockets. There are two possibilities for implementing this:
-
-.B 1)
-implementation of an own eBPF agent that takes care of setting up
-the Unix domain socket and implementing the protocol that
-.B tc(8)
-dictates. A code example of this can be found inside the iproute2
-source package under:
-.B examples/bpf/
-
-.B 2)
-use
-.B tc exec
-for transferring the eBPF map file descriptors through a Unix domain
-socket, and spawning an application such as
-.B sh(1)
-\&. This approach's advantage is that tc will place the file descriptors
-into the environment and thus make them available just like stdin, stdout,
-stderr file descriptors, meaning, in case user applications run from within
-this fd-owner shell, they can terminate and restart without losing eBPF
-maps file descriptors. Example invocation with the previous classifier and
-action mixture:
-
-.in +4n
-.B tc exec bpf imp /tmp/bpf
-.br
-.B tc filter add dev em1 parent 1: bpf obj bpf.o exp /tmp/bpf flowid 1:1 \e
-.br
-.in +25n
-.B                          action bpf obj bpf.o sec action-mark \e
-.br
-.B                          action bpf obj bpf.o sec action-rand ok
-.in -25n
-.in -4n
-
-Assuming that eBPF maps are shared with classifier and actions, it's
-enough to export them once, for example, from within the classifier
-or action command. tc will setup all eBPF map file descriptors at the
-time when the object file is first parsed.
-
-When a shell has been spawned, the environment will have a couple of
-eBPF related variables. BPF_NUM_MAPS provides the total number of maps
-that have been transferred over the Unix domain socket. BPF_MAP<X>'s
-value is the file descriptor number that can be accessed in eBPF agent
-applications, in other words, it can directly be used as the file
-descriptor value for the
+setup lifetime by pinning them in the BPF file system. Maps declared
+with the
+.B pinning
+attribute set to
+.B LIBBPF_PIN_BY_NAME
+are pinned under
+.B /sys/fs/bpf/tc/globals/
+and can be inspected or updated with
+.B bpftool(8)
+or any program using the
 .B bpf(2)
-system call to retrieve or alter eBPF map values. <X> denotes the
-identifier of the eBPF map. It corresponds to the
-.B id
-member of
-.B struct bpf_elf_map
-\& from the tc eBPF map specification.
-
-The environment in this example looks as follows:
-
-.in +4n
-.nf
-.sp
-sh# env | grep BPF
-    BPF_NUM_MAPS=3
-    BPF_MAP1=6
-    BPF_MAP0=5
-    BPF_MAP2=7
-sh# ls -la /proc/self/fd
-    [...]
-    lrwx------. 1 root root 64 Apr 14 16:46 5 -> anon_inode:bpf-map
-    lrwx------. 1 root root 64 Apr 14 16:46 6 -> anon_inode:bpf-map
-    lrwx------. 1 root root 64 Apr 14 16:46 7 -> anon_inode:bpf-map
-sh# my_bpf_agent
-.fi
-.in
-
-eBPF agents are very useful in that they can prepopulate eBPF maps from
-user space, monitor statistics via maps and based on that feedback, for
-example, rewrite classids in eBPF map values during runtime. Given that eBPF
-agents are implemented as normal applications, they can also dynamically
-receive traffic control policies from external controllers and thus push
-them down into eBPF maps to dynamically adapt to network conditions. Moreover,
-eBPF maps can also be shared with other eBPF program types (e.g. tracing),
-thus very powerful combination can therefore be implemented.
+system call.
 
 .SS eBPF PROGRAMMING
 
@@ -588,17 +493,15 @@ struct tuple {
         long bytes;
 };
 
-#define BPF_MAP_ID_STATS        1 /* agent's map identifier */
 #define BPF_MAX_MARK            256
 
-struct bpf_elf_map __section("maps") map_stats = {
-        .type           =       BPF_MAP_TYPE_ARRAY,
-        .id             =       BPF_MAP_ID_STATS,
-        .size_key       =       sizeof(uint32_t),
-        .size_value     =       sizeof(struct tuple),
-        .max_elem       =       BPF_MAX_MARK,
-        .pinning        =       PIN_GLOBAL_NS,
-};
+struct {
+        __uint(type, BPF_MAP_TYPE_ARRAY);
+        __type(key, uint32_t);
+        __type(value, struct tuple);
+        __uint(max_entries, BPF_MAX_MARK);
+        __uint(pinning, LIBBPF_PIN_BY_NAME);
+} map_stats __section(".maps");
 
 static inline void cls_update_stats(const struct __sk_buff *skb,
                                     uint32_t mark)
@@ -710,23 +613,13 @@ in both examples was:
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-/* Object pinning settings */
-#define PIN_NONE       0
-#define PIN_OBJECT_NS  1
-#define PIN_GLOBAL_NS  2
+/* BTF map definition, see also bpf/bpf_helpers.h from libbpf */
+#define __uint(name, val) int (*name)[val]
+#define __type(name, val) typeof(val) *name
 
-/* ELF map definition */
-struct bpf_elf_map {
-    __u32 type;
-    __u32 size_key;
-    __u32 size_value;
-    __u32 max_elem;
-    __u32 flags;
-    __u32 id;
-    __u32 pinning;
-    __u32 inner_id;
-    __u32 inner_idx;
-};
+/* Object pinning settings */
+#define LIBBPF_PIN_NONE     0
+#define LIBBPF_PIN_BY_NAME  1
 
 /* Some used BPF function calls. */
 static int (*bpf_skb_store_bytes)(void *ctx, int off, void *from,

@@ -2,20 +2,20 @@
 
 /* Minimal, stand-alone toy map pinning example:
  *
- * clang -target bpf -O2 [...] -o bpf_shared.o -c bpf_shared.c
+ * clang -target bpf -O2 -g [...] -o bpf_shared.o -c bpf_shared.c
  * tc filter add dev foo parent 1: bpf obj bpf_shared.o sec egress
  * tc filter add dev foo parent ffff: bpf obj bpf_shared.o sec ingress
  *
  * Both classifier will share the very same map instance in this example,
  * so map content can be accessed from ingress *and* egress side!
  *
- * This example has a pinning of PIN_OBJECT_NS, so it's private and
- * thus shared among various program sections within the object.
+ * Sections within one object file always refer to the same map, so the
+ * two programs above would share map_sh even without any pinning.
  *
- * A setting of PIN_GLOBAL_NS would place it into a global namespace,
- * so that it can be shared among different object files. A setting
- * of PIN_NONE (= 0) means no sharing, so each tc invocation a new map
- * instance is being created.
+ * LIBBPF_PIN_BY_NAME pins the map under /sys/fs/bpf/tc/globals/map_sh,
+ * which is what lets a *different* object file, or a later tc
+ * invocation, pick up the same instance. Without it (LIBBPF_PIN_NONE,
+ * the default) each tc invocation creates a new map.
  */
 
 struct {

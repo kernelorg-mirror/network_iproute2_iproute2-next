@@ -205,7 +205,7 @@ _tc_direct_complete()
             ;;
 
         # BPF options - used for filters, actions, and exec
-        export|bytecode|bytecode-file|object-file)
+        bytecode|bytecode-file|object-file)
             _filedir
             return 0
             ;;
@@ -228,10 +228,6 @@ _tc_direct_complete()
                     sed -n 's/^ *[0-9]\+ \([^ ]*\) *.*/\1/p' )
                 COMPREPLY+=( $( compgen -W "$section_list" -- "$cur" ) )
             fi
-            return 0
-            ;;
-        import|run)
-            _filedir
             return 0
             ;;
         type)
@@ -387,10 +383,7 @@ _tc_qdisc_options()
 _tc_bpf_options()
 {
     [[ ${words[${#words[@]}-3]} == object-file ]] && \
-        _tc_once_attr 'section export'
-    [[ ${words[${#words[@]}-5]} == object-file ]] && \
-        [[ ${words[${#words[@]}-3]} =~ (section|export) ]] && \
-        _tc_once_attr 'section export'
+        _tc_once_attr 'section'
     _tc_one_of_list 'bytecode bytecode-file object-file object-pinned'
     _tc_once_attr 'verbose index direct-action action classid'
     return 0
@@ -524,11 +517,6 @@ _tc_action_options()
 _tc_exec_options()
 {
     case $1 in
-        import)
-            [[ ${words[${#words[@]}-3]} == import ]] && \
-                _tc_once_attr 'run'
-            return 0
-            ;;
         graft)
             COMPREPLY+=( $( compgen -W 'key type' -- "$cur" ) )
             [[ ${words[${#words[@]}-3]} == object-file ]] && \
@@ -772,7 +760,7 @@ _tc()
         exec)
             case $subcmd in
                 bpf)
-                    local excmd exwd EXEC_KIND=' import debug graft '
+                    local excmd exwd EXEC_KIND=' debug graft '
                     for ((exwd=$subcword; exwd < ${#words[@]}-1; exwd++)); do
                         if [[ $EXEC_KIND =~ ' '${words[exwd]}' ' ]]; then
                             excmd=${words[exwd]}
